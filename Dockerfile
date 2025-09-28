@@ -31,25 +31,8 @@ COPY --chown=app:app pyproject.toml ./
 RUN pip install --user --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --user --no-cache-dir .
 
-# Pre-download common AI models to include in image
-RUN mkdir -p models/cache && \
-    python -c "
-from transformers import AutoModel, AutoTokenizer
-import torch
-try:
-    # Pre-cache ResNet for scene classification
-    AutoModel.from_pretrained('microsoft/resnet-50', cache_dir='models/cache')
-    print('✅ ResNet-50 cached')
-except:
-    print('⚠️ ResNet-50 cache failed')
-try:
-    # Pre-cache YOLO weights
-    from ultralytics import YOLO
-    YOLO('yolov8n.pt').export(format='onnx')
-    print('✅ YOLOv8 cached')
-except:
-    print('⚠️ YOLOv8 cache failed')
-"
+# Create models cache directory
+RUN mkdir -p models/cache
 
 # =================================================================
 # Production stage
@@ -81,8 +64,6 @@ RUN apt-get update && apt-get install -y \
     libxrender-dev \
     libgomp1 \
     libgeos-dev \
-    # GPU support (optional)
-    libnvidia-compute-520 \
     # Utilities
     curl \
     wget \
@@ -103,8 +84,8 @@ WORKDIR /home/app
 # Copy Python dependencies from builder stage
 COPY --from=builder --chown=app:app /home/app/.local /home/app/.local
 
-# Copy pre-cached models from builder stage
-COPY --from=builder --chown=app:app /home/app/models /home/app/models
+# Create models directory (models will be downloaded on first use)
+RUN mkdir -p models/cache
 
 # Create necessary directories with proper permissions
 RUN mkdir -p \
@@ -207,6 +188,9 @@ RUN mkdir -p ~/.jupyter && \
 
 # Expose Jupyter port
 EXPOSE 8888
+
+# Set working directory to src for proper module imports
+WORKDIR /home/app/src
 
 # Override command for development with hot reload
 CMD ["uvicorn", "fn_media_ai.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--reload", "--log-level", "debug"]
