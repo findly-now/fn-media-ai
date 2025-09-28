@@ -1,0 +1,158 @@
+name: Deploy to GKE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+env:
+  PROJECT_ID: findly-now
+  GKE_CLUSTER: findly-cluster
+  GKE_ZONE: us-central1-a
+  DEPLOYMENT_NAME: media-ai
+  IMAGE: fn-media-ai
+
+jobs:
+  setup-build-publish-deploy:
+    name: Setup, Build, Publish, and Deploy
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set Environment
+      run: |
+        if [ "${{ github.event.inputs.environment }}" != "" ]; then
+          echo "ENVIRONMENT=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+        else
+          echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+        fi
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          tesseract-ocr \
+          tesseract-ocr-eng \
+          libglib2.0-0 \
+          libsm6 \
+          libxext6 \
+          libxrender-dev \
+          libgomp1
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install .
+
+    - name: Format check
+      run: |
+        pip install black isort
+        black --check .
+        isort --check-only .
+
+    - name: Lint
+      run: |
+        pip install flake8 mypy
+        flake8 .
+        mypy .
+
+    - name: Run tests
+      run: |
+        pip install pytest pytest-cov
+        pytest
+
+    - id: 'auth'
+      name: 'Authenticate to Google Cloud'
+      uses: 'google-github-actions/auth@v1'
+      with:
+        credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+    - name: 'Set up Cloud SDK'
+      uses: 'google-github-actions/setup-gcloud@v1'
+
+    - name: 'Use gcloud CLI'
+      run: 'gcloud info'
+
+    - name: Configure Docker to use gcloud as a credential helper
+      run: |-
+        gcloud --quiet auth configure-docker
+
+    - name: Get the GKE credentials so we can deploy to the cluster
+      run: |-
+        gcloud container clusters get-credentials "$GKE_CLUSTER" --zone "$GKE_ZONE"
+
+    - name: Build the Docker image
+      run: |-
+        docker build --tag "gcr.io/$PROJECT_ID/$IMAGE:$GITHUB_SHA" .
+
+    - name: Push the Docker image to Google Container Registry
+      run: |-
+        docker push "gcr.io/$PROJECT_ID/$IMAGE:$GITHUB_SHA"
+
+    - name: Set up Kustomize
+      run: |-
+        curl -sfLo kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v3.1.0/kustomize_3.1.0_linux_amd64
+        chmod u+x ./kustomize
+
+    - name: Deploy to GKE
+      run: |-
+        # Clone infrastructure repository
+        git clone https://github.com/your-org/fn-infra.git
+        cd fn-infra
+
+        # Replace the image name in the deployment
+        sed -i "s|gcr.io/PROJECT_ID/fn-media-ai:main-latest|gcr.io/$PROJECT_ID/$IMAGE:$GITHUB_SHA|g" k8s/base/media-ai-deployment.yaml
+
+        # Apply the configurations for the specific environment
+        kubectl apply -f k8s/environments/$ENVIRONMENT/media-ai-configmap.yaml
+
+        # Apply the deployment and service
+        kubectl apply -f k8s/base/media-ai-deployment.yaml
+        kubectl apply -f k8s/base/media-ai-service.yaml
+
+        # Verify the deployment
+        kubectl rollout status deployment/$DEPLOYMENT_NAME -n findly
+        kubectl get services -o wide -n findly
+
+    - name: Verify deployment
+      run: |-
+        kubectl get pods -n findly -l app=media-ai
+        kubectl get service media-ai -n findly
+
+    - name: Run health check
+      run: |-
+        # Wait for deployment to be ready
+        kubectl wait --for=condition=available --timeout=300s deployment/media-ai -n findly
+
+        # Get the service IP and port for health check
+        echo "Deployment completed successfully"

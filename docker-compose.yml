@@ -1,0 +1,274 @@
+# =================================================================
+# FN Media AI - Local Development Environment
+# Includes Redis, Kafka, PostgreSQL, and supporting services
+# =================================================================
+
+version: '3.8'
+
+services:
+  # =================================================================
+  # Main AI Service
+  # =================================================================
+  fn-media-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: fn-media-ai-dev
+    ports:
+      - "8000:8000"    # Main API
+      - "8888:8888"    # Jupyter Lab
+      - "9090:9090"    # Metrics
+    volumes:
+      - ./src:/home/app/src
+      - ./tests:/home/app/tests
+      - ./scripts:/home/app/scripts
+      - ./models:/home/app/models
+      - ./logs:/home/app/logs
+      - ai-models-cache:/home/app/models/cache
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=DEBUG
+      - REDIS_URL=redis://redis:6379/0
+      - KAFKA_BROKERS=kafka:9092
+      - DATABASE_URL=postgresql://findly:findly@postgres:5432/findly_media_ai
+      - GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcs-key.json
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-demo-key}
+      - FEATURE_GPU_ACCELERATION=false
+      - AI_PROCESSING_TIMEOUT=60
+    depends_on:
+      - redis
+      - kafka
+      - postgres
+    networks:
+      - findly-ai-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # =================================================================
+  # Redis - AI Result Caching
+  # =================================================================
+  redis:
+    image: redis:7.2-alpine
+    container_name: fn-media-ai-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+      - ./scripts/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: redis-server /usr/local/etc/redis/redis.conf
+    networks:
+      - findly-ai-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # =================================================================
+  # PostgreSQL - Metadata Storage
+  # =================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: fn-media-ai-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: findly_media_ai
+      POSTGRES_USER: findly
+      POSTGRES_PASSWORD: findly
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./scripts/postgres/schema.sql:/docker-entrypoint-initdb.d/02-schema.sql:ro
+    networks:
+      - findly-ai-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U findly -d findly_media_ai"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # =================================================================
+  # Apache Kafka - Event Streaming
+  # =================================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: fn-media-ai-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - findly-ai-network
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: fn-media-ai-kafka
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    depends_on:
+      - zookeeper
+    networks:
+      - findly-ai-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =================================================================
+  # Kafka UI - Development Tool
+  # =================================================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: fn-media-ai-kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    depends_on:
+      - kafka
+    networks:
+      - findly-ai-network
+    restart: unless-stopped
+
+  # =================================================================
+  # MinIO - S3-compatible Storage (for testing GCS integration)
+  # =================================================================
+  minio:
+    image: minio/minio:latest
+    container_name: fn-media-ai-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - findly-ai-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =================================================================
+  # Prometheus - Metrics Collection
+  # =================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: fn-media-ai-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./scripts/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - findly-ai-network
+    restart: unless-stopped
+
+  # =================================================================
+  # Grafana - Metrics Visualization
+  # =================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: fn-media-ai-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./scripts/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./scripts/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    networks:
+      - findly-ai-network
+    restart: unless-stopped
+
+  # =================================================================
+  # Jaeger - Distributed Tracing
+  # =================================================================
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: fn-media-ai-jaeger
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14268:14268"  # Jaeger collector
+    environment:
+      COLLECTOR_OTLP_ENABLED: true
+    networks:
+      - findly-ai-network
+    restart: unless-stopped
+
+# =================================================================
+# Networks
+# =================================================================
+networks:
+  findly-ai-network:
+    driver: bridge
+    name: findly-ai-network
+
+# =================================================================
+# Volumes
+# =================================================================
+volumes:
+  redis-data:
+    name: fn-media-ai-redis-data
+  postgres-data:
+    name: fn-media-ai-postgres-data
+  kafka-data:
+    name: fn-media-ai-kafka-data
+  zookeeper-data:
+    name: fn-media-ai-zookeeper-data
+  zookeeper-logs:
+    name: fn-media-ai-zookeeper-logs
+  minio-data:
+    name: fn-media-ai-minio-data
+  prometheus-data:
+    name: fn-media-ai-prometheus-data
+  grafana-data:
+    name: fn-media-ai-grafana-data
+  ai-models-cache:
+    name: fn-media-ai-models-cache

@@ -15,14 +15,21 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
+from fn_media_ai.infrastructure.config.settings import get_settings
+from fn_media_ai.infrastructure.kafka.consumer import KafkaConsumerManager
+from fn_media_ai.web.controllers.health import router as health_router
+from fn_media_ai.web.middleware.logging import LoggingMiddleware
+
 
 # Configure structured logging
 def configure_logging() -> None:
     """Configure structured logging with correlation IDs."""
+    settings = get_settings()
+
     logging.basicConfig(
         format="%(message)s",
         stream=sys.stdout,
-        level=logging.INFO,
+        level=getattr(logging, settings.log_level.upper()),
     )
 
     structlog.configure(
@@ -48,52 +55,74 @@ def configure_logging() -> None:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifespan events."""
     logger = structlog.get_logger()
+    settings = get_settings()
 
     # Startup
-    logger.info("Starting FN Media AI service")
+    logger.info("Starting FN Media AI service", version="0.1.0")
 
-    # TODO: Initialize AI models
-    # TODO: Initialize Redis connection
-    # TODO: Initialize Kafka consumers
-    # TODO: Verify GCS connectivity
-    # TODO: Test OpenAI API connection
+    # Initialize Kafka consumer
+    kafka_manager = KafkaConsumerManager(settings)
 
-    logger.info("FN Media AI service ready")
+    try:
+        await kafka_manager.start()
+        logger.info("Kafka consumer started successfully")
 
-    yield
+        # Store in app state for access during shutdown
+        app.state.kafka_manager = kafka_manager
 
-    # Shutdown
-    logger.info("Shutting down FN Media AI service")
+        logger.info("FN Media AI service ready",
+                   kafka_topics=settings.kafka_consumer_topics)
 
-    # TODO: Cleanup AI models
-    # TODO: Close Redis connection
-    # TODO: Stop Kafka consumers
+        yield
 
-    logger.info("FN Media AI service stopped")
+    except Exception as e:
+        logger.error("Failed to start service", error=str(e))
+        raise
+    finally:
+        # Shutdown
+        logger.info("Shutting down FN Media AI service")
+
+        if hasattr(app.state, 'kafka_manager'):
+            await app.state.kafka_manager.stop()
+            logger.info("Kafka consumer stopped")
+
+        logger.info("FN Media AI service stopped")
 
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     configure_logging()
+    settings = get_settings()
 
     app = FastAPI(
         title="FN Media AI",
         description="AI-powered photo analysis service for Lost & Found post enhancement",
         version="0.1.0",
         lifespan=lifespan,
+        docs_url="/docs" if settings.debug else None,
+        redoc_url="/redoc" if settings.debug else None,
     )
 
+    # Add custom logging middleware
+    app.add_middleware(LoggingMiddleware)
+
     # Security middleware
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=settings.allowed_hosts
+    )
 
     # CORS middleware
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # Configure properly in production
-        allow_credentials=False,
-        allow_methods=["GET", "POST"],
-        allow_headers=["*"],
+        allow_origins=settings.cors_origins,
+        allow_credentials=settings.cors_allow_credentials,
+        allow_methods=settings.cors_allow_methods,
+        allow_headers=settings.cors_allow_headers,
     )
+
+    # Include routers
+    app.include_router(health_router, prefix="/api/v1")
 
     @app.get("/")
     async def root():
@@ -101,25 +130,24 @@ def create_app() -> FastAPI:
         return {
             "service": "fn-media-ai",
             "version": "0.1.0",
-            "description": "AI-powered photo analysis for Lost & Found enhancement"
+            "description": "AI-powered photo analysis for Lost & Found enhancement",
+            "docs_url": "/docs" if settings.debug else None
         }
-
-    @app.get("/health")
-    async def health():
-        """Health check endpoint."""
-        return {"status": "healthy", "service": "fn-media-ai"}
 
     return app
 
 
 def main() -> None:
     """Main entry point for the application."""
+    settings = get_settings()
+
     uvicorn.run(
         "fn_media_ai.main:create_app",
         factory=True,
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
+        host=settings.host,
+        port=settings.port,
+        reload=settings.debug,
+        log_level=settings.log_level.lower(),
     )
 
 

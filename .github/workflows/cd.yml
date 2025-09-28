@@ -1,0 +1,504 @@
+name: CD - Deploy to Environments
+
+on:
+  push:
+    branches:
+      - main          # Deploy to production
+      - develop       # Deploy to staging
+      - 'feature/*'   # Deploy to dev
+  workflow_dispatch:   # Manual deployment
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+      force_deploy:
+        description: 'Force deployment even if tests fail'
+        required: false
+        default: false
+        type: boolean
+
+# Global environment variables
+env:
+  PROJECT_ID: findly-production
+  GAR_LOCATION: us-central1
+  REPOSITORY: findly-services
+  SERVICE: fn-media-ai
+  REGION: us-central1
+  REGISTRY: us-central1-docker.pkg.dev
+
+# Limit concurrency to one deployment per environment
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'production') || (github.ref == 'refs/heads/develop' && 'staging') || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  # =================================================================
+  # Environment Setup
+  # =================================================================
+  setup:
+    name: Setup Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      k8s_namespace: ${{ steps.set-env.outputs.k8s_namespace }}
+      image_tag: ${{ steps.set-env.outputs.image_tag }}
+      image_name: ${{ steps.set-env.outputs.image_name }}
+      deploy_gpu: ${{ steps.set-env.outputs.deploy_gpu }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set environment based on branch or input
+      id: set-env
+      run: |
+        # Determine environment
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          ENV="${{ github.event.inputs.environment }}"
+        elif [[ ${{ github.ref }} == 'refs/heads/main' ]]; then
+          ENV="production"
+        elif [[ ${{ github.ref }} == 'refs/heads/develop' ]]; then
+          ENV="staging"
+        else
+          ENV="dev"
+        fi
+
+        # Set outputs
+        echo "environment=${ENV}" >> $GITHUB_OUTPUT
+        echo "k8s_namespace=findly" >> $GITHUB_OUTPUT
+
+        # Generate unique image tag
+        SHORT_SHA=$(git rev-parse --short HEAD)
+        TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+        TAG="${ENV}-${TIMESTAMP}-${SHORT_SHA}"
+        echo "image_tag=${TAG}" >> $GITHUB_OUTPUT
+        echo "image_name=${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE }}:${TAG}" >> $GITHUB_OUTPUT
+
+        # GPU deployment for production and staging only
+        if [ "${ENV}" == "production" ] || [ "${ENV}" == "staging" ]; then
+          echo "deploy_gpu=true" >> $GITHUB_OUTPUT
+        else
+          echo "deploy_gpu=false" >> $GITHUB_OUTPUT
+        fi
+
+        echo "🚀 Deploying to: ${ENV}"
+        echo "📦 Image: ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE }}:${TAG}"
+
+  # =================================================================
+  # Pre-deployment Tests (if not forced)
+  # =================================================================
+  pre-deploy-tests:
+    name: Pre-deployment Tests
+    runs-on: ubuntu-latest
+    needs: setup
+    if: github.event.inputs.force_deploy != 'true'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+
+    - name: Run critical tests
+      env:
+        ENVIRONMENT: test
+        TEST_MOCK_EXTERNAL_APIS: true
+      run: |
+        # Run only critical tests that must pass for deployment
+        pytest tests/e2e/ \
+          -m "critical" \
+          -v \
+          --tb=short \
+          --maxfail=1 \
+          || (echo "❌ Critical tests failed - deployment blocked" && exit 1)
+
+        echo "✅ Critical tests passed - deployment approved"
+
+  # =================================================================
+  # Build and Push Container Images
+  # =================================================================
+  build:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: [setup, pre-deploy-tests]
+    if: always() && (needs.pre-deploy-tests.result == 'success' || needs.pre-deploy-tests.result == 'skipped')
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Authenticate to Google Cloud
+      id: auth
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+
+    - name: Configure Docker to use gcloud as credential helper
+      run: gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev
+
+    - name: Build and push production image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        target: production
+        platforms: linux/amd64
+        push: true
+        tags: ${{ needs.setup.outputs.image_name }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          ENVIRONMENT=${{ needs.setup.outputs.environment }}
+
+    - name: Build and push GPU image (if needed)
+      if: needs.setup.outputs.deploy_gpu == 'true'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        target: gpu
+        platforms: linux/amd64
+        push: true
+        tags: ${{ needs.setup.outputs.image_name }}-gpu
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          ENVIRONMENT=${{ needs.setup.outputs.environment }}
+
+    - name: Run container security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ needs.setup.outputs.image_name }}
+        format: 'table'
+        exit-code: '1'
+        ignore-unfixed: true
+        severity: 'CRITICAL,HIGH'
+
+  # =================================================================
+  # Deploy to Kubernetes
+  # =================================================================
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: [setup, build]
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+      url: ${{ steps.deployment.outputs.service_url }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+
+    - name: Get GKE credentials
+      uses: google-github-actions/get-gke-credentials@v1
+      with:
+        cluster_name: ${{ secrets.GKE_CLUSTER }}
+        location: ${{ secrets.GKE_ZONE }}
+
+    - name: Clone fn-infra repository
+      run: |
+        git clone https://github.com/findly-now/fn-infra.git /tmp/fn-infra || \
+        git clone https://${{ secrets.GITHUB_TOKEN }}@github.com/findly-now/fn-infra.git /tmp/fn-infra
+
+    - name: Update deployment manifests
+      id: deployment
+      run: |
+        cd /tmp/fn-infra
+
+        # Update image in deployment
+        ENV="${{ needs.setup.outputs.environment }}"
+        IMAGE="${{ needs.setup.outputs.image_name }}"
+        NAMESPACE="${{ needs.setup.outputs.k8s_namespace }}"
+
+        echo "🔄 Updating deployment for environment: ${ENV}"
+
+        # Apply environment-specific configurations
+        kubectl apply -f k8s/environments/${ENV}/media-ai-configmap.yaml -n ${NAMESPACE}
+        kubectl apply -f k8s/base/media-ai-service.yaml -n ${NAMESPACE}
+
+        # Check if deployment exists
+        if kubectl get deployment media-ai -n ${NAMESPACE} >/dev/null 2>&1; then
+          echo "📦 Updating existing deployment with image: ${IMAGE}"
+          kubectl set image deployment/media-ai media-ai=${IMAGE} -n ${NAMESPACE}
+        else
+          echo "🆕 Creating new deployment"
+          # Create deployment from template (this would need to be implemented)
+          kubectl create deployment media-ai \
+            --image=${IMAGE} \
+            --port=8000 \
+            -n ${NAMESPACE}
+
+          # Apply resource limits and configurations
+          kubectl patch deployment media-ai -n ${NAMESPACE} --patch '{
+            "spec": {
+              "template": {
+                "spec": {
+                  "containers": [{
+                    "name": "media-ai",
+                    "resources": {
+                      "requests": {
+                        "memory": "1Gi",
+                        "cpu": "500m"
+                      },
+                      "limits": {
+                        "memory": "4Gi",
+                        "cpu": "2000m"
+                      }
+                    },
+                    "envFrom": [{
+                      "configMapRef": {
+                        "name": "media-ai-config"
+                      }
+                    }],
+                    "ports": [{
+                      "containerPort": 8000,
+                      "name": "http"
+                    }, {
+                      "containerPort": 9090,
+                      "name": "metrics"
+                    }],
+                    "livenessProbe": {
+                      "httpGet": {
+                        "path": "/health",
+                        "port": 8000
+                      },
+                      "initialDelaySeconds": 60,
+                      "periodSeconds": 30,
+                      "timeoutSeconds": 10
+                    },
+                    "readinessProbe": {
+                      "httpGet": {
+                        "path": "/health",
+                        "port": 8000
+                      },
+                      "initialDelaySeconds": 30,
+                      "periodSeconds": 10,
+                      "timeoutSeconds": 5
+                    }
+                  }]
+                }
+              }
+            }
+          }'
+        fi
+
+        # Wait for rollout to complete
+        echo "⏳ Waiting for deployment rollout..."
+        kubectl rollout status deployment/media-ai -n ${NAMESPACE} --timeout=600s
+
+        # Get service URL
+        SERVICE_IP=$(kubectl get service media-ai -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "cluster-internal")
+        SERVICE_URL="http://${SERVICE_IP}:80"
+        echo "service_url=${SERVICE_URL}" >> $GITHUB_OUTPUT
+
+        echo "✅ Deployment completed successfully"
+
+    - name: Configure Horizontal Pod Autoscaler
+      run: |
+        NAMESPACE="${{ needs.setup.outputs.k8s_namespace }}"
+        ENV="${{ needs.setup.outputs.environment }}"
+
+        # Set HPA based on environment
+        if [ "${ENV}" == "production" ]; then
+          MIN_REPLICAS=3
+          MAX_REPLICAS=20
+          CPU_TARGET=70
+        elif [ "${ENV}" == "staging" ]; then
+          MIN_REPLICAS=2
+          MAX_REPLICAS=10
+          CPU_TARGET=80
+        else
+          MIN_REPLICAS=1
+          MAX_REPLICAS=5
+          CPU_TARGET=90
+        fi
+
+        kubectl autoscale deployment media-ai \
+          --min=${MIN_REPLICAS} \
+          --max=${MAX_REPLICAS} \
+          --cpu-percent=${CPU_TARGET} \
+          -n ${NAMESPACE} \
+          --overwrite=true
+
+        echo "🔄 HPA configured: ${MIN_REPLICAS}-${MAX_REPLICAS} replicas, ${CPU_TARGET}% CPU target"
+
+  # =================================================================
+  # Post-deployment Verification
+  # =================================================================
+  verify:
+    name: Post-deployment Verification
+    runs-on: ubuntu-latest
+    needs: [setup, deploy]
+
+    steps:
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+
+    - name: Get GKE credentials
+      uses: google-github-actions/get-gke-credentials@v1
+      with:
+        cluster_name: ${{ secrets.GKE_CLUSTER }}
+        location: ${{ secrets.GKE_ZONE }}
+
+    - name: Verify deployment health
+      run: |
+        NAMESPACE="${{ needs.setup.outputs.k8s_namespace }}"
+
+        echo "🔍 Verifying deployment health..."
+
+        # Check deployment status
+        kubectl get deployment media-ai -n ${NAMESPACE}
+
+        # Check pods
+        kubectl get pods -l app=media-ai -n ${NAMESPACE}
+
+        # Wait for pods to be ready
+        kubectl wait --for=condition=ready pod -l app=media-ai -n ${NAMESPACE} --timeout=300s
+
+        # Test health endpoint from within cluster
+        POD=$(kubectl get pods -l app=media-ai -n ${NAMESPACE} -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec ${POD} -n ${NAMESPACE} -- curl -f http://localhost:8000/health
+
+        echo "✅ Deployment verification successful"
+
+    - name: Run smoke tests
+      run: |
+        NAMESPACE="${{ needs.setup.outputs.k8s_namespace }}"
+        POD=$(kubectl get pods -l app=media-ai -n ${NAMESPACE} -o jsonpath='{.items[0].metadata.name}')
+
+        echo "🧪 Running smoke tests..."
+
+        # Test API endpoints
+        kubectl exec ${POD} -n ${NAMESPACE} -- curl -f http://localhost:8000/health
+        kubectl exec ${POD} -n ${NAMESPACE} -- curl -f http://localhost:8000/metrics
+
+        # Test AI service availability (mock)
+        kubectl exec ${POD} -n ${NAMESPACE} -- python -c "
+        import sys
+        try:
+            from fn_media_ai.main import create_app
+            print('✅ Application imports successfully')
+        except Exception as e:
+            print(f'❌ Application import failed: {e}')
+            sys.exit(1)
+        "
+
+        echo "✅ Smoke tests passed"
+
+  # =================================================================
+  # Rollback on Failure
+  # =================================================================
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: [setup, deploy, verify]
+    if: failure()
+
+    steps:
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+
+    - name: Get GKE credentials
+      uses: google-github-actions/get-gke-credentials@v1
+      with:
+        cluster_name: ${{ secrets.GKE_CLUSTER }}
+        location: ${{ secrets.GKE_ZONE }}
+
+    - name: Rollback deployment
+      run: |
+        NAMESPACE="${{ needs.setup.outputs.k8s_namespace }}"
+
+        echo "🔄 Rolling back deployment due to failure..."
+
+        # Rollback to previous revision
+        kubectl rollout undo deployment/media-ai -n ${NAMESPACE}
+
+        # Wait for rollback to complete
+        kubectl rollout status deployment/media-ai -n ${NAMESPACE} --timeout=300s
+
+        # Verify rollback
+        kubectl get deployment media-ai -n ${NAMESPACE}
+        kubectl get pods -l app=media-ai -n ${NAMESPACE}
+
+        echo "✅ Rollback completed"
+
+  # =================================================================
+  # Deployment Summary
+  # =================================================================
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [setup, build, deploy, verify]
+    if: always()
+
+    steps:
+    - name: Generate deployment summary
+      run: |
+        echo "# 🚀 FN Media AI - Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Environment info
+        echo "**Environment**: ${{ needs.setup.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Image**: ${{ needs.setup.outputs.image_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Namespace**: ${{ needs.setup.outputs.k8s_namespace }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Deployment status
+        if [ "${{ needs.deploy.result }}" == "success" ]; then
+          echo "✅ **Deployment**: Success" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Deployment**: Failed" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Verification status
+        if [ "${{ needs.verify.result }}" == "success" ]; then
+          echo "✅ **Verification**: Success" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Verification**: Failed" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Workflow**: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+
+        # Service URL if available
+        if [ "${{ needs.deploy.outputs.service_url }}" != "" ]; then
+          echo "**Service URL**: ${{ needs.deploy.outputs.service_url }}" >> $GITHUB_STEP_SUMMARY
+        fi

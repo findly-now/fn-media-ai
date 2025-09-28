@@ -98,9 +98,9 @@ dev = [
 ]
 
 gpu = [
-    # GPU-accelerated PyTorch
-    "torch>=2.5.0+cu124",
-    "torchvision>=0.20.0+cu124",
+    # GPU-accelerated PyTorch (install separately with: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124)
+    "torch>=2.5.0",
+    "torchvision>=0.20.0",
 ]
 
 cloud = [
