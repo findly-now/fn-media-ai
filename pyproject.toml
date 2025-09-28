@@ -1,0 +1,230 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fn-media-ai"
+version = "0.1.0"
+description = "AI-powered photo analysis service for Lost & Found post enhancement"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Findly Now Team", email = "team@findly-now.com"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.11"
+dependencies = [
+    # Web Framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+
+    # Event Processing
+    "confluent-kafka>=2.6.0",
+
+    # Cloud Storage
+    "google-cloud-storage>=2.18.0",
+    "google-auth>=2.35.0",
+
+    # AI/ML Core
+    "openai>=1.54.0",
+    "transformers>=4.45.0",
+    "torch>=2.5.0",
+    "torchvision>=0.20.0",
+    "accelerate>=1.0.0",
+
+    # Computer Vision
+    "opencv-python-headless>=4.10.0",
+    "pillow>=10.4.0",
+    "scikit-image>=0.24.0",
+
+    # OCR
+    "pytesseract>=0.3.13",
+    "easyocr>=1.7.2",
+
+    # Object Detection
+    "ultralytics>=8.3.0",  # YOLO models
+    "supervision>=0.24.0",  # Computer vision utilities
+
+    # Data & ML Utilities
+    "numpy>=2.1.0",
+    "pandas>=2.2.0",
+    "scikit-learn>=1.5.0",
+
+    # Caching & Storage
+    "redis>=5.1.0",
+    "aioredis>=2.0.1",
+
+    # HTTP Client
+    "httpx>=0.28.0",
+    "aiofiles>=24.1.0",
+
+    # Utilities
+    "python-multipart>=0.0.12",  # File uploads
+    "python-json-logger>=2.0.7",
+    "structlog>=24.4.0",
+    "tenacity>=9.0.0",  # Retry logic
+    "prometheus-client>=0.21.0",  # Metrics
+]
+
+[project.optional-dependencies]
+dev = [
+    # Testing
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "pytest-mock>=3.14.0",
+    "httpx>=0.28.0",  # For test client
+
+    # Code Quality
+    "black>=24.10.0",
+    "isort>=5.13.0",
+    "flake8>=7.1.0",
+    "mypy>=1.13.0",
+    "bandit>=1.7.10",
+
+    # Development Tools
+    "pre-commit>=4.0.0",
+    "ipython>=8.29.0",
+    "jupyter>=1.1.0",
+]
+
+gpu = [
+    # GPU-accelerated PyTorch
+    "torch>=2.5.0+cu124",
+    "torchvision>=0.20.0+cu124",
+]
+
+cloud = [
+    # Cloud deployment
+    "gunicorn>=23.0.0",
+    "kubernetes>=31.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/findly-now/fn-media-ai"
+Repository = "https://github.com/findly-now/fn-media-ai"
+Documentation = "https://github.com/findly-now/fn-media-ai/docs"
+"Bug Tracker" = "https://github.com/findly-now/fn-media-ai/issues"
+
+[project.scripts]
+fn-media-ai = "fn_media_ai.main:main"
+
+# Black configuration
+[tool.black]
+line-length = 88
+target-version = ['py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+  | models/cache
+)/
+'''
+
+# isort configuration
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["fn_media_ai"]
+known_third_party = ["fastapi", "pydantic", "torch", "transformers", "opencv", "PIL"]
+
+# mypy configuration
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "cv2.*",
+    "ultralytics.*",
+    "supervision.*",
+    "easyocr.*",
+    "pytesseract.*",
+]
+ignore_missing_imports = true
+
+# pytest configuration
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--cov=src/fn_media_ai",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-report=xml",
+]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "e2e: marks tests as end-to-end tests",
+    "gpu: marks tests that require GPU",
+    "cloud: marks tests that require cloud services",
+]
+
+# Coverage configuration
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+    "*/__pycache__/*",
+    "*/migrations/*",
+    "*/venv/*",
+    "*/virtualenv/*",
+    "*/.venv/*",
+    "*/.env/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
+
+# Bandit security linting
+[tool.bandit]
+exclude_dirs = ["tests", "build", "dist"]
+skips = ["B101", "B601"]  # Skip assert_used, shell=True warnings in tests
