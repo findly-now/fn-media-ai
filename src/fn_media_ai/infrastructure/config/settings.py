@@ -42,13 +42,13 @@ class Settings(BaseSettings):
 
     # Kafka consumer settings
     kafka_consumer_group: str = Field(default="fn-media-ai", env="KAFKA_CONSUMER_GROUP")
-    kafka_consumer_topics: List[str] = Field(default=["post-events"], env="KAFKA_CONSUMER_TOPICS")
+    kafka_consumer_topics: List[str] = Field(default=["posts.events"], env="KAFKA_CONSUMER_TOPICS")
     kafka_auto_offset_reset: str = Field(default="latest", env="KAFKA_AUTO_OFFSET_RESET")
     kafka_enable_auto_commit: bool = Field(default=True, env="KAFKA_ENABLE_AUTO_COMMIT")
     kafka_max_poll_records: int = Field(default=500, env="KAFKA_MAX_POLL_RECORDS")
 
     # Kafka producer settings
-    kafka_post_enhanced_topic: str = Field(default="post-events", env="KAFKA_POST_ENHANCED_TOPIC")
+    kafka_post_enhanced_topic: str = Field(default="media-ai.enrichment", env="KAFKA_POST_ENHANCED_TOPIC")
     kafka_producer_acks: str = Field(default="all", env="KAFKA_PRODUCER_ACKS")
     kafka_producer_retries: int = Field(default=2147483647, env="KAFKA_PRODUCER_RETRIES")
     kafka_producer_batch_size: int = Field(default=16384, env="KAFKA_PRODUCER_BATCH_SIZE")
