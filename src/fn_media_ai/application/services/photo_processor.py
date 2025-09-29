@@ -13,8 +13,9 @@ from fn_media_ai.application.commands.process_photo import (
     ProcessPhotoCommand,
     ProcessPhotoResult,
 )
+from fn_media_ai.application.commands.process_photo_command import ProcessPhotosCommand
 from fn_media_ai.application.services.event_publisher import EventPublishingService
-from fn_media_ai.domain.entities.photo_analysis import PhotoAnalysis
+from fn_media_ai.domain.aggregates.photo_analysis import PhotoAnalysis
 from fn_media_ai.domain.services.ai_model_pipeline import (
     AIModelPipeline,
     ConfidenceEvaluator,
@@ -49,7 +50,56 @@ class PhotoProcessorService:
         self.repository = repository
         self.logger = structlog.get_logger()
 
-    async def process_photos(self, command: ProcessPhotoCommand) -> ProcessPhotoResult:
+    async def process_photos(self, command: ProcessPhotosCommand) -> PhotoAnalysis:
+        """
+        Process photos from API command.
+
+        Args:
+            command: Simple photo processing command from API
+
+        Returns:
+            PhotoAnalysis: Complete analysis results
+        """
+        correlation_id = command.correlation_id or "api-request"
+        logger = self.logger.bind(
+            correlation_id=correlation_id,
+            post_id=command.post_id,
+            photo_count=len(command.photo_urls),
+        )
+
+        logger.info("Starting photo processing from API")
+
+        try:
+            # Validate photos before processing
+            valid_photos = await self._validate_photos(command.photo_urls, logger)
+            if not valid_photos:
+                raise ValueError("No valid photos found for analysis")
+
+            # Process photos through AI pipeline (it handles everything internally)
+            analysis = await self.ai_pipeline.analyze_photos(
+                valid_photos,
+                command.post_id or "api-request"
+            )
+
+            logger.info(
+                "Photo processing completed",
+                analysis_id=str(analysis.id),
+                confidence=analysis.overall_confidence.value if analysis.overall_confidence else None
+            )
+
+            return analysis
+
+        except Exception as e:
+            logger.error("Photo processing failed", error=str(e), exc_info=True)
+            # Create a minimal analysis result even on failure
+            analysis = PhotoAnalysis(
+                post_id=command.post_id or "api-request",
+                photo_urls=command.photo_urls
+            )
+            analysis.fail_processing(str(e))
+            return analysis
+
+    async def process_photos_from_event(self, command: ProcessPhotoCommand) -> ProcessPhotoResult:
         """
         Process photos according to the command specifications.
 

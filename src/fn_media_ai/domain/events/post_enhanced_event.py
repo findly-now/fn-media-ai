@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
-from fn_media_ai.domain.entities.photo_analysis import PhotoAnalysis
+from fn_media_ai.domain.aggregates.photo_analysis import PhotoAnalysis
 from fn_media_ai.domain.value_objects.confidence import ConfidenceScore
 
 

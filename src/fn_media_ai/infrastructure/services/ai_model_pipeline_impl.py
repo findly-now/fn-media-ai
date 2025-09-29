@@ -10,7 +10,7 @@ import logging
 import time
 from typing import List, Optional
 
-from fn_media_ai.domain.entities.photo_analysis import PhotoAnalysis
+from fn_media_ai.domain.aggregates.photo_analysis import PhotoAnalysis
 from fn_media_ai.domain.services.ai_model_pipeline import AIModelPipeline
 from fn_media_ai.domain.value_objects.confidence import ConfidenceScore
 from fn_media_ai.infrastructure.adapters.huggingface_adapter import HuggingFaceAdapter

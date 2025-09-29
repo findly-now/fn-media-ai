@@ -14,7 +14,7 @@ import structlog
 
 from fn_media_ai.infrastructure.service_factory import get_service_factory
 from fn_media_ai.infrastructure.config.settings import get_settings
-from fn_media_ai.domain.entities.photo_analysis import PhotoAnalysis
+from fn_media_ai.domain.aggregates.photo_analysis import PhotoAnalysis
 from fn_media_ai.domain.value_objects.confidence import (
     ProcessingStatus,
     ConfidenceScore,

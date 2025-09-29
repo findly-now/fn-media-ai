@@ -8,7 +8,7 @@ Follows DDD principle of keeping domain pure from infrastructure concerns.
 from abc import ABC, abstractmethod
 from typing import List
 
-from fn_media_ai.domain.entities.photo_analysis import PhotoAnalysis
+from fn_media_ai.domain.aggregates.photo_analysis import PhotoAnalysis
 
 
 class AIModelPipeline(ABC):

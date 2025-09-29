@@ -10,7 +10,7 @@ from uuid import UUID
 
 import structlog
 
-from fn_media_ai.domain.entities.photo_analysis import PhotoAnalysis
+from fn_media_ai.domain.aggregates.photo_analysis import PhotoAnalysis
 from fn_media_ai.domain.events.post_enhanced_event import (
     PostEnhancedEvent,
     PostEnhancedEventFactory,

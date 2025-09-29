@@ -1,294 +1,204 @@
 """
-PhotoAnalysis aggregate root for the domain.
+PhotoAnalysis aggregate root entity.
 
-The PhotoAnalysis entity is the main aggregate root that coordinates
-all AI analysis results for a post's photos.
+Core domain entity that manages AI analysis results for photos
+with proper business rules and invariants.
 """
 
+import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import List, Optional, Dict, Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
-
-from fn_media_ai.domain.value_objects.confidence import (
-    ColorDetection,
-    ConfidenceScore,
-    LocationInference,
-    ModelVersion,
-    ObjectDetection,
-    ProcessingStatus,
-    SceneClassification,
-    TextExtraction,
-)
+from fn_media_ai.domain.value_objects.confidence_score import ConfidenceScore
+from fn_media_ai.domain.value_objects.object_detection import ObjectDetection
+from fn_media_ai.domain.value_objects.scene_classification import SceneClassification
+from fn_media_ai.domain.value_objects.extracted_text import ExtractedText
+from fn_media_ai.domain.value_objects.color_analysis import ColorAnalysis
+from fn_media_ai.domain.value_objects.enhancement_level import EnhancementLevel
 
 
-class PhotoAnalysis(BaseModel):
+class PhotoAnalysis:
     """
-    Aggregate root for AI photo analysis results.
+    Aggregate root for photo analysis results.
 
-    Coordinates all analysis results for photos associated with a Lost & Found post.
-    Maintains business invariants and provides methods for result combination.
+    Encapsulates all AI analysis results for a set of photos and
+    enforces business rules around confidence scoring and enhancement.
     """
 
-    # Identity
-    id: UUID = Field(default_factory=uuid4, description="Analysis ID")
-    post_id: UUID = Field(..., description="Associated post ID")
-    photo_urls: List[str] = Field(..., min_items=1, description="Analyzed photo URLs")
+    def __init__(
+        self,
+        photo_urls: List[str],
+        post_id: Optional[str] = None,
+        analysis_id: Optional[UUID] = None
+    ):
+        """Initialize photo analysis."""
+        self.id = analysis_id or uuid4()
+        self.photo_urls = photo_urls
+        self.post_id = UUID(post_id) if post_id and post_id != "api-request" else None
+        self.created_at = datetime.utcnow()
+        self.processing_start_time = time.time()
 
-    # Processing metadata
-    status: ProcessingStatus = Field(default=ProcessingStatus.PENDING)
-    started_at: Optional[datetime] = Field(None, description="Processing start time")
-    completed_at: Optional[datetime] = Field(None, description="Processing completion time")
-    processing_time_ms: Optional[int] = Field(None, ge=0, description="Processing duration")
+        # Analysis results
+        self.detected_objects: List[ObjectDetection] = []
+        self.scene_classification: Optional[SceneClassification] = None
+        self.extracted_text: List[ExtractedText] = []
+        self.color_analysis: Optional[ColorAnalysis] = None
 
-    # Analysis results
-    objects: List[ObjectDetection] = Field(default_factory=list)
-    scenes: List[SceneClassification] = Field(default_factory=list)
-    text_extractions: List[TextExtraction] = Field(default_factory=list)
-    colors: List[ColorDetection] = Field(default_factory=list)
-    location_inference: Optional[LocationInference] = Field(None)
+        # Generated metadata
+        self.generated_tags: List[str] = []
+        self.suggested_title: Optional[str] = None
+        self.suggested_description: Optional[str] = None
 
-    # Aggregated results
-    generated_tags: List[str] = Field(default_factory=list, description="AI-generated tags")
-    enhanced_description: Optional[str] = Field(None, description="AI-enhanced description")
-    overall_confidence: Optional[ConfidenceScore] = Field(None, description="Overall confidence")
+        # Confidence and enhancement
+        self.overall_confidence_score: Optional[ConfidenceScore] = None
+        self.enhancement_level: EnhancementLevel = EnhancementLevel.NONE
 
-    # Model versioning for traceability
-    model_versions: Dict[str, ModelVersion] = Field(default_factory=dict)
-
-    # Error handling
-    errors: List[str] = Field(default_factory=list, description="Processing errors")
-
-    class Config:
-        arbitrary_types_allowed = True
-
-    def start_processing(self) -> None:
-        """Mark analysis as started."""
-        if self.status != ProcessingStatus.PENDING:
-            raise ValueError(f"Cannot start processing from status: {self.status}")
-
-        self.status = ProcessingStatus.PROCESSING
-        self.started_at = datetime.utcnow()
-
-    def complete_processing(self) -> None:
-        """Mark analysis as completed and calculate processing time."""
-        if self.status != ProcessingStatus.PROCESSING:
-            raise ValueError(f"Cannot complete processing from status: {self.status}")
-
-        if self.started_at is None:
-            raise ValueError("Cannot complete processing without start time")
-
-        self.status = ProcessingStatus.COMPLETED
-        self.completed_at = datetime.utcnow()
-        self.processing_time_ms = int(
-            (self.completed_at - self.started_at).total_seconds() * 1000
-        )
-
-    def fail_processing(self, error: str) -> None:
-        """Mark analysis as failed with error."""
-        if self.status != ProcessingStatus.PROCESSING:
-            raise ValueError(f"Cannot fail processing from status: {self.status}")
-
-        self.status = ProcessingStatus.FAILED
-        self.completed_at = datetime.utcnow()
-        self.errors.append(error)
-
-        if self.started_at:
-            self.processing_time_ms = int(
-                (self.completed_at - self.started_at).total_seconds() * 1000
-            )
+        # Processing metadata
+        self.processing_time_ms: Optional[float] = None
+        self.model_versions: Dict[str, str] = {}
 
     def add_object_detection(self, detection: ObjectDetection) -> None:
         """Add object detection result."""
-        if self.status not in [ProcessingStatus.PROCESSING, ProcessingStatus.COMPLETED]:
-            raise ValueError("Cannot add results to non-processing analysis")
+        if detection.confidence.value >= 0.5:  # Business rule: minimum confidence
+            self.detected_objects.append(detection)
 
-        self.objects.append(detection)
+    def set_scene_classification(self, classification: SceneClassification) -> None:
+        """Set scene classification result."""
+        if classification.confidence.value >= 0.6:  # Business rule: minimum confidence
+            self.scene_classification = classification
 
-    def add_scene_classification(self, scene: SceneClassification) -> None:
-        """Add scene classification result."""
-        if self.status not in [ProcessingStatus.PROCESSING, ProcessingStatus.COMPLETED]:
-            raise ValueError("Cannot add results to non-processing analysis")
+    def add_extracted_text(self, text: ExtractedText) -> None:
+        """Add extracted text result."""
+        if text.confidence.value >= 0.3:  # OCR typically has lower confidence
+            self.extracted_text.append(text)
 
-        self.scenes.append(scene)
+    def set_color_analysis(self, color_analysis: ColorAnalysis) -> None:
+        """Set color analysis result."""
+        self.color_analysis = color_analysis
 
-    def add_text_extraction(self, text: TextExtraction) -> None:
-        """Add text extraction result."""
-        if self.status not in [ProcessingStatus.PROCESSING, ProcessingStatus.COMPLETED]:
-            raise ValueError("Cannot add results to non-processing analysis")
+    def calculate_overall_confidence(self) -> None:
+        """Calculate overall confidence based on all analysis results."""
+        confidence_scores = []
 
-        self.text_extractions.append(text)
+        # Object detection confidence
+        if self.detected_objects:
+            obj_confidence = sum(obj.confidence.value for obj in self.detected_objects) / len(self.detected_objects)
+            confidence_scores.append(obj_confidence * 0.4)  # 40% weight
 
-    def add_color_detection(self, color: ColorDetection) -> None:
-        """Add color detection result."""
-        if self.status not in [ProcessingStatus.PROCESSING, ProcessingStatus.COMPLETED]:
-            raise ValueError("Cannot add results to non-processing analysis")
+        # Scene classification confidence
+        if self.scene_classification:
+            confidence_scores.append(self.scene_classification.confidence.value * 0.3)  # 30% weight
 
-        self.colors.append(color)
+        # Text extraction confidence
+        if self.extracted_text:
+            text_confidence = sum(text.confidence.value for text in self.extracted_text) / len(self.extracted_text)
+            confidence_scores.append(text_confidence * 0.2)  # 20% weight
 
-    def set_location_inference(self, location: LocationInference) -> None:
-        """Set location inference result."""
-        if self.status not in [ProcessingStatus.PROCESSING, ProcessingStatus.COMPLETED]:
-            raise ValueError("Cannot add results to non-processing analysis")
+        # Color analysis confidence (always high if present)
+        if self.color_analysis:
+            confidence_scores.append(0.9 * 0.1)  # 10% weight
 
-        self.location_inference = location
+        if confidence_scores:
+            overall_score = sum(confidence_scores)
+            self.overall_confidence_score = ConfidenceScore(overall_score)
 
-    def set_model_version(self, task: str, model: ModelVersion) -> None:
-        """Record model version used for specific task."""
-        self.model_versions[task] = model
+            # Determine enhancement level based on confidence
+            if overall_score >= 0.85:
+                self.enhancement_level = EnhancementLevel.AUTO_ENHANCE
+            elif overall_score >= 0.70:
+                self.enhancement_level = EnhancementLevel.SUGGEST_TAGS
+            elif overall_score >= 0.50:
+                self.enhancement_level = EnhancementLevel.HUMAN_REVIEW
+            else:
+                self.enhancement_level = EnhancementLevel.DISCARD
+        else:
+            self.overall_confidence_score = ConfidenceScore(0.0)
+            self.enhancement_level = EnhancementLevel.DISCARD
 
-    def generate_tags(self) -> List[str]:
-        """Generate searchable tags from all analysis results."""
+    def generate_tags(self) -> None:
+        """Generate tags from analysis results."""
         tags = set()
 
-        # Object tags
-        for obj in self.objects:
-            if obj.confidence.should_suggest():
+        # Tags from object detection
+        for obj in self.detected_objects:
+            if obj.confidence.value >= 0.7:  # High confidence objects only
                 tags.add(obj.name.lower())
-                # Add attributes as tags
-                for attr_value in obj.attributes.values():
-                    if isinstance(attr_value, str):
-                        tags.add(attr_value.lower())
+                if obj.brand:
+                    tags.add(obj.brand.lower())
 
-        # Scene tags
-        for scene in self.scenes:
-            if scene.confidence.should_suggest():
-                tags.add(scene.scene.lower())
-                tags.update(sub.lower() for sub in scene.sub_scenes)
+        # Tags from scene classification
+        if self.scene_classification and self.scene_classification.confidence.value >= 0.8:
+            tags.add(self.scene_classification.scene_type.lower())
 
-        # Color tags
-        for color in self.colors:
-            if color.confidence.should_suggest():
-                tags.add(color.color_name.lower())
+        # Tags from extracted text (brands, serial numbers)
+        for text in self.extracted_text:
+            if text.text_type == "brand" and text.confidence.value >= 0.5:
+                tags.add(text.content.lower())
 
-        # Text tags (meaningful words only)
-        for text in self.text_extractions:
-            if text.confidence.should_suggest() and len(text.text) > 2:
-                # Simple text processing - in production use NLP
-                words = text.text.lower().split()
-                meaningful_words = [w for w in words if len(w) > 3]
-                tags.update(meaningful_words)
+        # Tags from color analysis
+        if self.color_analysis:
+            for color in self.color_analysis.dominant_colors[:3]:  # Top 3 colors
+                if color.confidence >= 0.8:
+                    tags.add(f"{color.name.lower()}_color")
 
-        self.generated_tags = sorted(list(tags))
-        return self.generated_tags
+        self.generated_tags = list(tags)[:20]  # Limit to 20 tags
 
-    def calculate_overall_confidence(self) -> ConfidenceScore:
-        """Calculate overall confidence from all analysis results."""
-        if not any([self.objects, self.scenes, self.text_extractions, self.colors]):
-            confidence_value = 0.0
-        else:
-            # Weighted average based on result type importance
-            weighted_scores = []
+    def complete_processing(self) -> None:
+        """Mark processing as complete and calculate metrics."""
+        self.processing_time_ms = (time.time() - self.processing_start_time) * 1000
 
-            # Objects are most important for Lost & Found
-            for obj in self.objects:
-                weighted_scores.extend([obj.confidence.value] * 3)
-
-            # Scenes provide context
-            for scene in self.scenes:
-                weighted_scores.extend([scene.confidence.value] * 2)
-
-            # Text and colors are supporting evidence
-            for text in self.text_extractions:
-                weighted_scores.append(text.confidence.value)
-
-            for color in self.colors:
-                weighted_scores.append(color.confidence.value)
-
-            confidence_value = sum(weighted_scores) / len(weighted_scores) if weighted_scores else 0.0
-
-        self.overall_confidence = ConfidenceScore(confidence_value)
-        return self.overall_confidence
-
-    def get_high_confidence_objects(self) -> List[ObjectDetection]:
-        """Get objects with high confidence for auto-enhancement."""
-        return [obj for obj in self.objects if obj.confidence.should_auto_enhance()]
-
-    def get_suggested_objects(self) -> List[ObjectDetection]:
-        """Get objects suitable for suggestions."""
-        return [obj for obj in self.objects if obj.confidence.should_suggest()]
-
-    def get_dominant_colors(self) -> List[ColorDetection]:
-        """Get dominant colors with sufficient confidence."""
-        return [
-            color for color in self.colors
-            if color.dominant and color.confidence.should_suggest()
-        ]
-
-    def get_extracted_text(self) -> List[str]:
-        """Get high-confidence extracted text."""
-        return [
-            text.text for text in self.text_extractions
-            if text.confidence.should_suggest()
-        ]
-
-    def has_location_inference(self) -> bool:
-        """Check if location inference is available and confident."""
-        return (
-            self.location_inference is not None
-            and self.location_inference.confidence.should_suggest()
-        )
-
-    def should_enhance_post(self) -> bool:
-        """Determine if analysis results should enhance the post."""
-        if self.status != ProcessingStatus.COMPLETED:
-            return False
-
-        if self.overall_confidence is None:
-            self.calculate_overall_confidence()
-
-        return self.overall_confidence.should_suggest()
-
-    def to_enhancement_metadata(self) -> dict:
-        """Convert analysis to post enhancement metadata format."""
-        if not self.should_enhance_post():
-            return {}
-
-        # Generate tags if not already done
-        if not self.generated_tags:
-            self.generate_tags()
-
-        # Calculate confidence if not already done
-        if self.overall_confidence is None:
-            self.calculate_overall_confidence()
-
-        metadata = {
-            "enhanced_description": self.enhanced_description,
-            "tags": self.generated_tags,
-            "attributes": {
-                "objects": [
-                    {
-                        "name": obj.name,
-                        "confidence": obj.confidence.value,
-                        "bounding_box": obj.bounding_box.dict() if obj.bounding_box else None,
-                    }
-                    for obj in self.get_suggested_objects()
-                ],
-                "colors": [color.color_name for color in self.get_dominant_colors()],
-                "scene": self.scenes[0].scene if self.scenes and self.scenes[0].confidence.should_suggest() else None,
-                "text_content": self.get_extracted_text(),
-            },
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "id": str(self.id),
+            "photo_urls": self.photo_urls,
+            "post_id": str(self.post_id) if self.post_id else None,
+            "created_at": self.created_at.isoformat(),
+            "detected_objects": [obj.to_dict() for obj in self.detected_objects],
+            "scene_classification": self.scene_classification.to_dict() if self.scene_classification else None,
+            "extracted_text": [text.to_dict() for text in self.extracted_text],
+            "color_analysis": self.color_analysis.to_dict() if self.color_analysis else None,
+            "generated_tags": self.generated_tags,
+            "suggested_title": self.suggested_title,
+            "suggested_description": self.suggested_description,
+            "overall_confidence_score": self.overall_confidence_score.value if self.overall_confidence_score else None,
+            "enhancement_level": self.enhancement_level.value,
+            "processing_time_ms": self.processing_time_ms,
+            "model_versions": self.model_versions
         }
 
-        if self.has_location_inference():
-            metadata["location_inference"] = {
-                "latitude": self.location_inference.latitude,
-                "longitude": self.location_inference.longitude,
-                "source": self.location_inference.source,
-                "confidence": self.location_inference.confidence.value,
-            }
+    def to_enhancement_metadata(self) -> Dict[str, Any]:
+        """Generate enhancement metadata for post updates."""
+        metadata = {
+            "ai_analysis_id": str(self.id),
+            "ai_confidence": self.overall_confidence_score.value if self.overall_confidence_score else 0.0,
+            "processing_time_ms": self.processing_time_ms,
+            "tags": self.generated_tags,
+            "detected_objects": [
+                {
+                    "name": obj.name,
+                    "confidence": obj.confidence.value,
+                    "brand": obj.brand
+                } for obj in self.detected_objects if obj.confidence.value >= 0.7
+            ]
+        }
+
+        if self.scene_classification:
+            metadata["scene_type"] = self.scene_classification.scene_type
+
+        if self.color_analysis:
+            metadata["dominant_colors"] = [
+                {
+                    "name": color.name,
+                    "confidence": color.confidence
+                } for color in self.color_analysis.dominant_colors[:3]
+            ]
+
+        if self.suggested_title:
+            metadata["suggested_title"] = self.suggested_title
+
+        if self.suggested_description:
+            metadata["suggested_description"] = self.suggested_description
 
         return metadata
-
-    def is_processing_complete(self) -> bool:
-        """Check if processing is complete (successfully or with failure)."""
-        return self.status in [ProcessingStatus.COMPLETED, ProcessingStatus.FAILED]
-
-    def has_errors(self) -> bool:
-        """Check if analysis has any errors."""
-        return len(self.errors) > 0
-
-    def __str__(self) -> str:
-        """String representation of the analysis."""
-        return f"PhotoAnalysis(id={self.id}, post_id={self.post_id}, status={self.status})"

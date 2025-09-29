@@ -14,7 +14,7 @@ import asyncpg
 import structlog
 from pydantic import ValidationError
 
-from fn_media_ai.domain.entities.photo_analysis import PhotoAnalysis
+from fn_media_ai.domain.aggregates.photo_analysis import PhotoAnalysis
 from fn_media_ai.domain.value_objects.confidence import (
     ProcessingStatus,
     ConfidenceScore,

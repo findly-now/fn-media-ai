@@ -313,6 +313,30 @@ class ServiceFactory:
         """Get database connection pool."""
         return self._db_pool
 
+    def create_photo_processor(self) -> PhotoProcessorService:
+        """Create a simple photo processor service without full initialization."""
+        from fn_media_ai.infrastructure.services.ai_model_pipeline_impl import AIModelPipelineImpl
+
+        # Create AI pipeline implementation (use existing implementation)
+        ai_pipeline = AIModelPipelineImpl()
+
+        # Create photo processor with minimal dependencies
+        return PhotoProcessorService(
+            ai_pipeline=ai_pipeline,
+            event_publisher=None,
+            repository=None
+        )
+
+    def create_gcs_client(self):
+        """Create Google Cloud Storage client."""
+        from fn_media_ai.infrastructure.clients.gcs import GCSClient
+        return GCSClient(self.settings)
+
+    def create_analysis_repository(self):
+        """Create photo analysis repository."""
+        from fn_media_ai.infrastructure.repositories.photo_analysis_repository import InMemoryPhotoAnalysisRepository
+        return InMemoryPhotoAnalysisRepository()
+
     # Health Check
 
     async def health_check(self) -> dict:

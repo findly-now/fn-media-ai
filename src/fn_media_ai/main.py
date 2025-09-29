@@ -18,6 +18,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fn_media_ai.infrastructure.config.settings import get_settings
 from fn_media_ai.infrastructure.kafka.consumer import KafkaConsumerManager
 from fn_media_ai.web.controllers.health import router as health_router
+from fn_media_ai.web.controllers.photos import router as photos_router
 from fn_media_ai.web.middleware.logging import LoggingMiddleware
 
 
@@ -123,6 +124,7 @@ def create_app() -> FastAPI:
 
     # Include routers
     app.include_router(health_router, prefix="/api/v1")
+    app.include_router(photos_router, prefix="/api/v1/photos")
 
     @app.get("/")
     async def root():

@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-from fn_media_ai.domain.entities.photo_analysis import PhotoAnalysis
+from fn_media_ai.domain.aggregates.photo_analysis import PhotoAnalysis
 from fn_media_ai.domain.value_objects.confidence import (
     ColorDetection,
     ConfidenceScore,

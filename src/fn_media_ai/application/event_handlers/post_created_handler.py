@@ -9,6 +9,7 @@ import structlog
 from typing import Dict, Any
 
 from fn_media_ai.application.commands.process_photo import ProcessPhotoCommand
+from fn_media_ai.application.commands.process_photo_command import ProcessPhotosCommand
 from fn_media_ai.application.services.photo_processor import PhotoProcessorService
 
 
@@ -67,34 +68,41 @@ class PostCreatedEventHandler:
                 logger.info("Post has no photos, skipping AI processing")
                 return
 
-            # Convert event to processing command
-            command = ProcessPhotoCommand.from_post_created_event(message)
+            # Extract photo URLs from the event
+            photo_urls = [photo.get('original_url') or photo.get('url') for photo in photos]
+            photo_urls = [url for url in photo_urls if url]  # Filter out None values
+
+            if not photo_urls:
+                logger.info("No valid photo URLs found in post")
+                return
+
+            # Create simple processing command for API-style processing
+            command = ProcessPhotosCommand(
+                photo_urls=photo_urls,
+                post_id=post_id,
+                user_id=post_data.get('user_id'),
+                item_type=post_data.get('item_type') or post_data.get('type')
+            )
 
             logger.info(
                 "Triggering photo processing",
                 photo_count=len(command.photo_urls),
-                post_type=command.post_type,
+                post_id=command.post_id,
             )
 
-            # Process photos
+            # Process photos using the simple API method
             result = await self.photo_processor.process_photos(command)
 
-            # Log results
-            if result.was_successful():
-                logger.info(
-                    "Photo processing completed successfully",
-                    analysis_id=str(result.analysis_id),
-                    objects_detected=result.objects_detected,
-                    auto_enhanced=result.auto_enhanced,
-                    processing_time_ms=result.processing_time_ms,
-                )
-            else:
-                logger.warning(
-                    "Photo processing completed with errors",
-                    analysis_id=str(result.analysis_id),
-                    errors=result.errors,
-                    partial_results=result.partial_results,
-                )
+            # Log results (PhotoAnalysis object instead of ProcessPhotoResult)
+            logger.info(
+                "Photo processing completed",
+                analysis_id=str(result.id),
+                status=result.status.value,
+                objects_detected=len(result.objects),
+                overall_confidence=result.overall_confidence.value if result.overall_confidence else None,
+                processing_time_ms=result.processing_time_ms,
+                has_errors=result.has_errors(),
+            )
 
         except EventValidationError as e:
             logger.warning("Invalid event received", error=str(e))
