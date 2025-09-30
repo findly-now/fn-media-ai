@@ -72,26 +72,50 @@ class PostgreSQLPhotoAnalysisRepository:
                 await conn.execute(
                     """
                     INSERT INTO photo_analyses (
-                        id, post_id, photo_urls, status, started_at, completed_at,
-                        processing_time_ms, analysis_data, created_at, updated_at
+                        id, post_id, photo_url, processing_status, processing_started_at,
+                        processing_completed_at, processing_duration_ms, confidence_score,
+                        object_detection_results, scene_classification_results,
+                        ocr_results, openai_vision_results, generated_tags,
+                        generated_description, location_inferences, brand_detections,
+                        model_versions, error_details, created_at, updated_at
                     ) VALUES (
-                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $9
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $19
                     )
                     ON CONFLICT (id) DO UPDATE SET
-                        status = EXCLUDED.status,
-                        completed_at = EXCLUDED.completed_at,
-                        processing_time_ms = EXCLUDED.processing_time_ms,
-                        analysis_data = EXCLUDED.analysis_data,
+                        processing_status = EXCLUDED.processing_status,
+                        processing_completed_at = EXCLUDED.processing_completed_at,
+                        processing_duration_ms = EXCLUDED.processing_duration_ms,
+                        confidence_score = EXCLUDED.confidence_score,
+                        object_detection_results = EXCLUDED.object_detection_results,
+                        scene_classification_results = EXCLUDED.scene_classification_results,
+                        ocr_results = EXCLUDED.ocr_results,
+                        openai_vision_results = EXCLUDED.openai_vision_results,
+                        generated_tags = EXCLUDED.generated_tags,
+                        generated_description = EXCLUDED.generated_description,
+                        location_inferences = EXCLUDED.location_inferences,
+                        brand_detections = EXCLUDED.brand_detections,
+                        model_versions = EXCLUDED.model_versions,
+                        error_details = EXCLUDED.error_details,
                         updated_at = EXCLUDED.updated_at
                     """,
                     analysis.id,
                     analysis.post_id,
-                    analysis.photo_urls,
+                    analysis.photo_urls[0] if analysis.photo_urls else None,  # Store first URL as primary
                     analysis.status.value,
                     analysis.started_at,
                     analysis.completed_at,
                     analysis.processing_time_ms,
-                    json.dumps(analysis_data),
+                    analysis.overall_confidence.value if analysis.overall_confidence else None,
+                    json.dumps([obj.__dict__ for obj in analysis.objects]) if analysis.objects else None,
+                    json.dumps([scene.__dict__ for scene in analysis.scenes]) if analysis.scenes else None,
+                    json.dumps([text.__dict__ for text in analysis.text_extractions]) if analysis.text_extractions else None,
+                    json.dumps(analysis_data.get('openai_results')) if analysis_data.get('openai_results') else None,
+                    analysis.generated_tags,
+                    analysis.enhanced_description,
+                    json.dumps(analysis_data.get('location_inference')) if analysis_data.get('location_inference') else None,
+                    json.dumps(analysis_data.get('brand_detections')) if analysis_data.get('brand_detections') else None,
+                    json.dumps({k: str(v) for k, v in analysis.model_versions.items()}) if analysis.model_versions else None,
+                    json.dumps(analysis.errors) if analysis.errors else None,
                     datetime.utcnow()
                 )
 
@@ -118,8 +142,12 @@ class PostgreSQLPhotoAnalysisRepository:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
                     """
-                    SELECT id, post_id, photo_urls, status, started_at, completed_at,
-                           processing_time_ms, analysis_data, created_at, updated_at
+                    SELECT id, post_id, photo_url, processing_status, processing_started_at,
+                           processing_completed_at, processing_duration_ms, confidence_score,
+                           object_detection_results, scene_classification_results,
+                           ocr_results, openai_vision_results, generated_tags,
+                           generated_description, location_inferences, brand_detections,
+                           model_versions, error_details, created_at, updated_at
                     FROM photo_analyses
                     WHERE id = $1
                     """,
@@ -156,8 +184,12 @@ class PostgreSQLPhotoAnalysisRepository:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
                     """
-                    SELECT id, post_id, photo_urls, status, started_at, completed_at,
-                           processing_time_ms, analysis_data, created_at, updated_at
+                    SELECT id, post_id, photo_url, processing_status, processing_started_at,
+                           processing_completed_at, processing_duration_ms, confidence_score,
+                           object_detection_results, scene_classification_results,
+                           ocr_results, openai_vision_results, generated_tags,
+                           generated_description, location_inferences, brand_detections,
+                           model_versions, error_details, created_at, updated_at
                     FROM photo_analyses
                     WHERE post_id = $1
                     ORDER BY created_at DESC
@@ -201,11 +233,15 @@ class PostgreSQLPhotoAnalysisRepository:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT id, post_id, photo_urls, status, started_at, completed_at,
-                           processing_time_ms, analysis_data, created_at, updated_at
+                    SELECT id, post_id, photo_url, processing_status, processing_started_at,
+                           processing_completed_at, processing_duration_ms, confidence_score,
+                           object_detection_results, scene_classification_results,
+                           ocr_results, openai_vision_results, generated_tags,
+                           generated_description, location_inferences, brand_detections,
+                           model_versions, error_details, created_at, updated_at
                     FROM photo_analyses
-                    WHERE status = 'completed'
-                    ORDER BY completed_at DESC
+                    WHERE processing_status = 'completed'
+                    ORDER BY processing_completed_at DESC
                     LIMIT $1 OFFSET $2
                     """,
                     limit,
@@ -240,12 +276,16 @@ class PostgreSQLPhotoAnalysisRepository:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT id, post_id, photo_urls, status, started_at, completed_at,
-                           processing_time_ms, analysis_data, created_at, updated_at
+                    SELECT id, post_id, photo_url, processing_status, processing_started_at,
+                           processing_completed_at, processing_duration_ms, confidence_score,
+                           object_detection_results, scene_classification_results,
+                           ocr_results, openai_vision_results, generated_tags,
+                           generated_description, location_inferences, brand_detections,
+                           model_versions, error_details, created_at, updated_at
                     FROM photo_analyses
-                    WHERE status = 'completed'
-                      AND CAST(analysis_data->>'overall_confidence' AS FLOAT) >= $1
-                    ORDER BY CAST(analysis_data->>'overall_confidence' AS FLOAT) DESC
+                    WHERE processing_status = 'completed'
+                      AND confidence_score >= $1
+                    ORDER BY confidence_score DESC
                     LIMIT $2
                     """,
                     confidence_threshold,
@@ -309,12 +349,11 @@ class PostgreSQLPhotoAnalysisRepository:
                     """
                     SELECT
                         COUNT(*) as total_analyses,
-                        COUNT(*) FILTER (WHERE status = 'completed') as completed_analyses,
-                        COUNT(*) FILTER (WHERE status = 'failed') as failed_analyses,
-                        COUNT(*) FILTER (WHERE status = 'processing') as processing_analyses,
-                        AVG(processing_time_ms) FILTER (WHERE status = 'completed') as avg_processing_time_ms,
-                        AVG(CAST(analysis_data->>'overall_confidence' AS FLOAT))
-                            FILTER (WHERE status = 'completed') as avg_confidence
+                        COUNT(*) FILTER (WHERE processing_status = 'completed') as completed_analyses,
+                        COUNT(*) FILTER (WHERE processing_status = 'failed') as failed_analyses,
+                        COUNT(*) FILTER (WHERE processing_status = 'processing') as processing_analyses,
+                        AVG(processing_duration_ms) FILTER (WHERE processing_status = 'completed') as avg_processing_time_ms,
+                        AVG(confidence_score) FILTER (WHERE processing_status = 'completed') as avg_confidence
                     FROM photo_analyses
                     """
                 )
@@ -403,75 +442,74 @@ class PostgreSQLPhotoAnalysisRepository:
             RepositoryError: When deserialization fails
         """
         try:
-            analysis_data = json.loads(row['analysis_data'])
-
             # Create PhotoAnalysis with basic fields
             analysis = PhotoAnalysis(
                 id=row['id'],
                 post_id=row['post_id'],
-                photo_urls=row['photo_urls'],
-                status=ProcessingStatus(row['status']),
-                started_at=row['started_at'],
-                completed_at=row['completed_at'],
-                processing_time_ms=row['processing_time_ms']
+                photo_urls=[row['photo_url']] if row['photo_url'] else [],
+                status=ProcessingStatus(row['processing_status']),
+                started_at=row['processing_started_at'],
+                completed_at=row['processing_completed_at'],
+                processing_time_ms=row['processing_duration_ms']
             )
 
-            # Restore complex fields from JSON data
-            analysis.generated_tags = analysis_data.get('generated_tags', [])
-            analysis.enhanced_description = analysis_data.get('enhanced_description')
-            analysis.errors = analysis_data.get('errors', [])
+            # Restore simple fields
+            analysis.generated_tags = row['generated_tags'] or []
+            analysis.enhanced_description = row['generated_description']
 
             # Restore confidence score
-            if analysis_data.get('overall_confidence') is not None:
-                analysis.overall_confidence = ConfidenceScore(analysis_data['overall_confidence'])
+            if row['confidence_score'] is not None:
+                analysis.overall_confidence = ConfidenceScore(float(row['confidence_score']))
 
-            # Restore model versions
-            analysis.model_versions = {
-                k: ModelVersion(v) for k, v in analysis_data.get('model_versions', {}).items()
-            }
+            # Restore model versions from JSON
+            if row['model_versions']:
+                model_versions_data = json.loads(row['model_versions'])
+                analysis.model_versions = {
+                    k: ModelVersion(v) for k, v in model_versions_data.items()
+                }
 
-            # Restore objects
-            for obj_data in analysis_data.get('objects', []):
-                obj = ObjectDetection(
-                    name=obj_data['name'],
-                    confidence=ConfidenceScore(obj_data['confidence']),
-                    attributes=obj_data.get('attributes', {}),
-                    bounding_box=obj_data.get('bounding_box')
-                )
-                analysis.objects.append(obj)
+            # Restore errors from JSON
+            if row['error_details']:
+                analysis.errors = json.loads(row['error_details'])
 
-            # Restore scenes
-            for scene_data in analysis_data.get('scenes', []):
-                scene = SceneClassification(
-                    scene=scene_data['scene'],
-                    confidence=ConfidenceScore(scene_data['confidence']),
-                    sub_scenes=scene_data.get('sub_scenes', [])
-                )
-                analysis.scenes.append(scene)
+            # Restore objects from JSON
+            if row['object_detection_results']:
+                objects_data = json.loads(row['object_detection_results'])
+                for obj_data in objects_data:
+                    obj = ObjectDetection(
+                        name=obj_data['name'],
+                        confidence=ConfidenceScore(obj_data['confidence']),
+                        attributes=obj_data.get('attributes', {}),
+                        bounding_box=obj_data.get('bounding_box')
+                    )
+                    analysis.objects.append(obj)
 
-            # Restore text extractions
-            for text_data in analysis_data.get('text_extractions', []):
-                text = TextExtraction(
-                    text=text_data['text'],
-                    confidence=ConfidenceScore(text_data['confidence']),
-                    language=text_data.get('language'),
-                    bounding_box=text_data.get('bounding_box')
-                )
-                analysis.text_extractions.append(text)
+            # Restore scenes from JSON
+            if row['scene_classification_results']:
+                scenes_data = json.loads(row['scene_classification_results'])
+                for scene_data in scenes_data:
+                    scene = SceneClassification(
+                        scene=scene_data['scene'],
+                        confidence=ConfidenceScore(scene_data['confidence']),
+                        sub_scenes=scene_data.get('sub_scenes', [])
+                    )
+                    analysis.scenes.append(scene)
 
-            # Restore colors
-            for color_data in analysis_data.get('colors', []):
-                color = ColorDetection(
-                    color_name=color_data['color_name'],
-                    hex_code=color_data.get('hex_code'),
-                    confidence=ConfidenceScore(color_data['confidence']),
-                    dominant=color_data.get('dominant', False)
-                )
-                analysis.colors.append(color)
+            # Restore text extractions from JSON
+            if row['ocr_results']:
+                texts_data = json.loads(row['ocr_results'])
+                for text_data in texts_data:
+                    text = TextExtraction(
+                        text=text_data['text'],
+                        confidence=ConfidenceScore(text_data['confidence']),
+                        language=text_data.get('language'),
+                        bounding_box=text_data.get('bounding_box')
+                    )
+                    analysis.text_extractions.append(text)
 
-            # Restore location inference
-            if analysis_data.get('location_inference'):
-                loc_data = analysis_data['location_inference']
+            # Restore location inference from JSON
+            if row['location_inferences']:
+                loc_data = json.loads(row['location_inferences'])
                 analysis.location_inference = LocationInference(
                     latitude=loc_data['latitude'],
                     longitude=loc_data['longitude'],

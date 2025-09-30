@@ -1,8 +1,16 @@
-name: Deploy to GKE
+name: Deploy fn-media-ai Service
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main          # Production deployment
+      - develop       # Development deployment
+    tags:
+      - 'v*'         # Semantic version releases
+  pull_request:
+    branches:
+      - main
+      - develop
   workflow_dispatch:
     inputs:
       environment:
@@ -12,147 +20,780 @@ on:
         type: choice
         options:
           - dev
-          - staging
-          - production
+          - prod
+      deployment_type:
+        description: 'Deployment type (CPU or GPU)'
+        required: true
+        default: 'cpu'
+        type: choice
+        options:
+          - cpu
+          - gpu
+      rollback:
+        description: 'Rollback to previous version'
+        required: false
+        default: false
+        type: boolean
 
 env:
-  PROJECT_ID: findly-now
+  PYTHON_VERSION: '3.11'
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GAR_LOCATION: us-central1
+  REPOSITORY: findly-services
+  SERVICE: fn-media-ai
   GKE_CLUSTER: findly-cluster
-  GKE_ZONE: us-central1-a
-  DEPLOYMENT_NAME: media-ai
-  IMAGE: fn-media-ai
+  HELM_VERSION: '3.13.0'
+  # AI Model versions for caching
+  YOLO_VERSION: 'yolov8n'
+  TRANSFORMERS_VERSION: '4.35.0'
+  TORCH_VERSION: '2.1.0'
+
+permissions:
+  contents: read
+  id-token: write  # Required for Workload Identity
 
 jobs:
-  setup-build-publish-deploy:
-    name: Setup, Build, Publish, and Deploy
+  # Build and Test Job
+  test:
+    name: Build and Test
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment || 'dev' }}
-
-    permissions:
-      contents: read
-      id-token: write
-
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for proper git history
 
-    - name: Set Environment
-      run: |
-        if [ "${{ github.event.inputs.environment }}" != "" ]; then
-          echo "ENVIRONMENT=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
-        else
-          echo "ENVIRONMENT=dev" >> $GITHUB_ENV
-        fi
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.local
+            .venv
+          key: ${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-
+            ${{ runner.os }}-python-
 
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          tesseract-ocr \
-          tesseract-ocr-eng \
-          libglib2.0-0 \
-          libsm6 \
-          libxext6 \
-          libxrender-dev \
-          libgomp1
+      - name: Cache AI models
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/torch
+            ~/.cache/huggingface
+            models/
+          key: ${{ runner.os }}-ai-models-${{ env.YOLO_VERSION }}-${{ env.TRANSFORMERS_VERSION }}
+          restore-keys: |
+            ${{ runner.os }}-ai-models-
 
-    - name: Cache pip dependencies
-      uses: actions/cache@v3
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e ".[dev]"
 
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install .
+      - name: Run code quality checks
+        run: |
+          # Format checking
+          black --check src/ tests/
+          isort --check-only src/ tests/
 
-    - name: Format check
-      run: |
-        pip install black isort
-        black --check .
-        isort --check-only .
+          # Linting
+          flake8 src/ tests/ --max-line-length=120 --ignore=E203,W503
 
-    - name: Lint
-      run: |
-        pip install flake8 mypy
-        flake8 .
-        mypy .
+          # Type checking
+          mypy src/ --ignore-missing-imports
 
-    - name: Run tests
-      run: |
-        pip install pytest pytest-cov
-        pytest
+      - name: Start test dependencies
+        run: |
+          # Start Redis for caching
+          docker run -d -p 6379:6379 --name redis redis:alpine
 
-    - id: 'auth'
-      name: 'Authenticate to Google Cloud'
-      uses: 'google-github-actions/auth@v1'
-      with:
-        credentials_json: '${{ secrets.GCP_SA_KEY }}'
+          # Wait for Redis to be ready
+          timeout 30 sh -c 'until docker exec redis redis-cli ping; do sleep 1; done'
 
-    - name: 'Set up Cloud SDK'
-      uses: 'google-github-actions/setup-gcloud@v1'
+      - name: Download AI models for testing
+        run: |
+          # Create models directory
+          mkdir -p models/cache
 
-    - name: 'Use gcloud CLI'
-      run: 'gcloud info'
+          # Download YOLO model if not cached
+          if [ ! -f "models/cache/yolov8n.pt" ]; then
+            python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+            cp yolov8n.pt models/cache/
+          fi
 
-    - name: Configure Docker to use gcloud as a credential helper
-      run: |-
-        gcloud --quiet auth configure-docker
+          # Pre-download key transformer models
+          python -c "
+          from transformers import pipeline
+          import torch
+          # Download ResNet for scene classification
+          pipe = pipeline('image-classification', model='microsoft/resnet-50')
+          "
 
-    - name: Get the GKE credentials so we can deploy to the cluster
-      run: |-
-        gcloud container clusters get-credentials "$GKE_CLUSTER" --zone "$GKE_ZONE"
+      - name: Run E2E tests
+        env:
+          OPENAI_API_KEY: ${{ secrets.TEST_OPENAI_API_KEY }}
+          GCS_BUCKET: ${{ secrets.TEST_GCS_BUCKET }}
+          GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.TEST_GCP_CREDENTIALS }}
+          KAFKA_BROKERS: ${{ secrets.TEST_KAFKA_BROKERS }}
+          KAFKA_SASL_USERNAME: ${{ secrets.TEST_KAFKA_USERNAME }}
+          KAFKA_SASL_PASSWORD: ${{ secrets.TEST_KAFKA_PASSWORD }}
+          REDIS_URL: redis://localhost:6379
+          ENVIRONMENT: test
+        run: |
+          # Create credentials file from secret
+          echo "$GOOGLE_APPLICATION_CREDENTIALS_JSON" > /tmp/gcp-credentials.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-credentials.json
 
-    - name: Build the Docker image
-      run: |-
-        docker build --tag "gcr.io/$PROJECT_ID/$IMAGE:$GITHUB_SHA" .
+          # Run E2E tests with coverage
+          pytest tests/e2e/ \
+            -v \
+            --cov=src/fn_media_ai \
+            --cov-report=html \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --tb=short \
+            --log-cli-level=INFO
 
-    - name: Push the Docker image to Google Container Registry
-      run: |-
-        docker push "gcr.io/$PROJECT_ID/$IMAGE:$GITHUB_SHA"
+      - name: Upload test coverage
+        if: success()
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: |
+            coverage.xml
+            htmlcov/
+          retention-days: 7
 
-    - name: Set up Kustomize
-      run: |-
-        curl -sfLo kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v3.1.0/kustomize_3.1.0_linux_amd64
-        chmod u+x ./kustomize
+      - name: Stop test dependencies
+        if: always()
+        run: |
+          docker stop redis || true
+          docker rm redis || true
+          rm -f /tmp/gcp-credentials.json
 
-    - name: Deploy to GKE
-      run: |-
-        # Clone infrastructure repository
-        git clone https://github.com/your-org/fn-infra.git
-        cd fn-infra
+  # Security Scanning Job
+  security:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-        # Replace the image name in the deployment
-        sed -i "s|gcr.io/PROJECT_ID/fn-media-ai:main-latest|gcr.io/$PROJECT_ID/$IMAGE:$GITHUB_SHA|g" k8s/base/media-ai-deployment.yaml
+      - name: Run Trivy security scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
 
-        # Apply the configurations for the specific environment
-        kubectl apply -f k8s/environments/$ENVIRONMENT/media-ai-configmap.yaml
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
 
-        # Apply the deployment and service
-        kubectl apply -f k8s/base/media-ai-deployment.yaml
-        kubectl apply -f k8s/base/media-ai-service.yaml
+      - name: Run Bandit security scanner for Python
+        run: |
+          pip install bandit[toml]
+          bandit -r src/ -f json -o bandit-results.json || true
 
-        # Verify the deployment
-        kubectl rollout status deployment/$DEPLOYMENT_NAME -n findly
-        kubectl get services -o wide -n findly
+      - name: Upload Bandit results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: bandit-results
+          path: bandit-results.json
+          retention-days: 7
 
-    - name: Verify deployment
-      run: |-
-        kubectl get pods -n findly -l app=media-ai
-        kubectl get service media-ai -n findly
+      - name: Run safety check for Python dependencies
+        run: |
+          pip install safety
+          safety check --json --output safety-results.json || true
 
-    - name: Run health check
-      run: |-
-        # Wait for deployment to be ready
-        kubectl wait --for=condition=available --timeout=300s deployment/media-ai -n findly
+      - name: Upload safety results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: safety-results
+          path: safety-results.json
+          retention-days: 7
 
-        # Get the service IP and port for health check
-        echo "Deployment completed successfully"
+  # Build and Push Docker Image
+  build-image:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version and environment
+        id: version
+        run: |
+          # Determine environment based on branch or input
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENV="${{ github.event.inputs.environment }}"
+            DEPLOYMENT_TYPE="${{ github.event.inputs.deployment_type }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == "refs/tags/v"* ]]; then
+            ENV="prod"
+            DEPLOYMENT_TYPE="gpu"  # Production uses GPU by default
+          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            ENV="dev"
+            DEPLOYMENT_TYPE="cpu"  # Dev uses CPU by default
+          else
+            ENV="dev"
+            DEPLOYMENT_TYPE="cpu"
+          fi
+
+          # Generate semantic version
+          if [[ "${{ github.ref }}" == "refs/tags/v"* ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            # Use git describe to generate version
+            VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "v0.0.0")
+            if [[ ! "$VERSION" == v* ]]; then
+              VERSION="v0.0.0-${VERSION}"
+            fi
+            # Add environment and build number
+            VERSION="${VERSION}-${ENV}.${GITHUB_RUN_NUMBER}"
+          fi
+
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "namespace=findly-${ENV}" >> $GITHUB_OUTPUT
+          echo "deployment_type=${DEPLOYMENT_TYPE}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+            image=moby/buildkit:master
+          buildkitd-flags: --debug
+          # Enable cache mount support for AI models
+          config-inline: |
+            [worker.oci]
+              max-parallelism = 4
+
+      - name: Authenticate to Google Cloud (Workload Identity)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          token_format: 'access_token'
+
+      - name: Configure Docker for Google Artifact Registry
+        run: |
+          echo "${{ steps.auth.outputs.access_token }}" | docker login -u oauth2accesstoken --password-stdin ${{ env.GAR_LOCATION }}-docker.pkg.dev
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE }}
+          flavor: |
+            latest=auto
+            suffix=-${{ steps.version.outputs.deployment_type }},onlatest=true
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix={{branch}}-,format=short
+          labels: |
+            org.opencontainers.image.title=fn-media-ai
+            org.opencontainers.image.description=AI-powered photo analysis service for Findly platform
+            org.opencontainers.image.vendor=Findly
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            ai.deployment.type=${{ steps.version.outputs.deployment_type }}
+            ai.models.yolo=${{ env.YOLO_VERSION }}
+            ai.models.torch=${{ env.TORCH_VERSION }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          target: production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=local,src=/tmp/.buildx-cache
+            type=registry,ref=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE }}:buildcache
+          cache-to: |
+            type=local,dest=/tmp/.buildx-cache-new,mode=max
+            type=registry,ref=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE }}:buildcache,mode=max
+          platforms: linux/amd64
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+            ENVIRONMENT=${{ steps.version.outputs.environment }}
+            PYTORCH_VERSION=${{ env.TORCH_VERSION }}
+            CUDA_VERSION=${{ steps.version.outputs.deployment_type == 'gpu' && '11.8' || '' }}
+            ENABLE_GPU=${{ steps.version.outputs.deployment_type == 'gpu' && 'true' || 'false' }}
+          # Increase timeout for large AI model downloads
+          no-cache-filters: |
+            download-models
+          secrets: |
+            "openai_key=${{ secrets.OPENAI_API_KEY }}"
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.meta.outputs.tags }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          retention-days: 30
+
+      - name: Container image vulnerability scanning
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE }}:${{ steps.version.outputs.version }}
+          format: 'sarif'
+          output: 'container-scan-results.sarif'
+
+      - name: Upload container scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'container-scan-results.sarif'
+
+  # Configure Redis Cache for AI Results
+  configure-cache:
+    name: Configure Redis Cache
+    runs-on: ubuntu-latest
+    needs: build-image
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    outputs:
+      redis_host: ${{ steps.redis.outputs.redis_host }}
+      redis_port: ${{ steps.redis.outputs.redis_port }}
+      redis_auth: ${{ steps.redis.outputs.redis_auth }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENV="${{ github.event.inputs.environment }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == "refs/tags/v"* ]]; then
+            ENV="prod"
+          else
+            ENV="dev"
+          fi
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+
+      - name: Configure Redis instance
+        id: redis
+        run: |
+          # Check if Redis instance exists, create if not
+          REDIS_INSTANCE="fn-media-ai-cache-${{ steps.env.outputs.environment }}"
+          REDIS_REGION="${{ env.GAR_LOCATION }}"
+
+          if ! gcloud redis instances describe $REDIS_INSTANCE --region=$REDIS_REGION &>/dev/null; then
+            echo "Creating Redis instance: $REDIS_INSTANCE"
+            gcloud redis instances create $REDIS_INSTANCE \
+              --size=5 \
+              --region=$REDIS_REGION \
+              --redis-version=redis_6_x \
+              --tier=standard \
+              --display-name="FN Media AI Cache - ${{ steps.env.outputs.environment }}" \
+              --labels="service=fn-media-ai,environment=${{ steps.env.outputs.environment }}" \
+              --redis-config=maxmemory-policy=allkeys-lru \
+              --redis-config=timeout=300 \
+              --redis-config=tcp-keepalive=60 \
+              --enable-auth
+          else
+            echo "Redis instance $REDIS_INSTANCE already exists"
+          fi
+
+          # Get Redis connection details
+          REDIS_HOST=$(gcloud redis instances describe $REDIS_INSTANCE --region=$REDIS_REGION --format="value(host)")
+          REDIS_PORT=$(gcloud redis instances describe $REDIS_INSTANCE --region=$REDIS_REGION --format="value(port)")
+          REDIS_AUTH=$(gcloud redis instances get-auth-string $REDIS_INSTANCE --region=$REDIS_REGION)
+
+          echo "redis_host=${REDIS_HOST}" >> $GITHUB_OUTPUT
+          echo "redis_port=${REDIS_PORT}" >> $GITHUB_OUTPUT
+          echo "::add-mask::${REDIS_AUTH}"
+          echo "redis_auth=${REDIS_AUTH}" >> $GITHUB_OUTPUT
+
+  # Deploy to GKE using Helm
+  deploy:
+    name: Deploy to GKE
+    runs-on: ubuntu-latest
+    needs: [build-image, configure-cache]
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event.inputs.rollback != 'true'
+    environment:
+      name: ${{ needs.build-image.outputs.version }}
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      environment: ${{ steps.params.outputs.environment }}
+      deployment_type: ${{ steps.params.outputs.deployment_type }}
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkout fn-infra repository
+        uses: actions/checkout@v4
+        with:
+          repository: findly-now/fn-infra
+          path: fn-infra
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: 'gke-gcloud-auth-plugin,kubectl'
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GAR_LOCATION }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Determine deployment parameters
+        id: params
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENV="${{ github.event.inputs.environment }}"
+            DEPLOYMENT_TYPE="${{ github.event.inputs.deployment_type }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == "refs/tags/v"* ]]; then
+            ENV="prod"
+            DEPLOYMENT_TYPE="gpu"
+          else
+            ENV="dev"
+            DEPLOYMENT_TYPE="cpu"
+          fi
+
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "namespace=findly-${ENV}" >> $GITHUB_OUTPUT
+          echo "values_file=values-${ENV}.yaml" >> $GITHUB_OUTPUT
+          echo "deployment_type=${DEPLOYMENT_TYPE}" >> $GITHUB_OUTPUT
+
+      - name: Create namespace if not exists
+        run: |
+          kubectl create namespace ${{ steps.params.outputs.namespace }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create ConfigMap for AI model configuration
+        run: |
+          kubectl create configmap ai-models-config \
+            --from-literal=yolo_version=${{ env.YOLO_VERSION }} \
+            --from-literal=torch_version=${{ env.TORCH_VERSION }} \
+            --from-literal=transformers_version=${{ env.TRANSFORMERS_VERSION }} \
+            --from-literal=deployment_type=${{ steps.params.outputs.deployment_type }} \
+            -n ${{ steps.params.outputs.namespace }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create GPU node pool if needed (GPU deployment)
+        if: steps.params.outputs.deployment_type == 'gpu'
+        run: |
+          # Check if GPU node pool exists
+          NODE_POOL="gpu-node-pool-${{ steps.params.outputs.environment }}"
+
+          if ! gcloud container node-pools describe $NODE_POOL \
+               --cluster=${{ env.GKE_CLUSTER }} \
+               --location=${{ env.GAR_LOCATION }} &>/dev/null; then
+            echo "Creating GPU node pool: $NODE_POOL"
+            gcloud container node-pools create $NODE_POOL \
+              --cluster=${{ env.GKE_CLUSTER }} \
+              --location=${{ env.GAR_LOCATION }} \
+              --machine-type=n1-standard-4 \
+              --accelerator="type=nvidia-tesla-t4,count=1" \
+              --num-nodes=1 \
+              --min-nodes=0 \
+              --max-nodes=3 \
+              --enable-autoscaling \
+              --node-taints="gpu=true:NoSchedule" \
+              --node-labels="gpu=true,service=fn-media-ai"
+
+            # Install NVIDIA GPU device drivers
+            kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/container-engine-accelerators/master/nvidia-driver-installer/cos/daemonset-preloaded.yaml
+          fi
+
+      - name: Deploy using Helm
+        id: deploy
+        run: |
+          # Add Helm repository for dependencies if needed
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo update
+
+          # Prepare deployment values
+          if [[ "${{ steps.params.outputs.deployment_type }}" == "gpu" ]]; then
+            GPU_RESOURCES="--set resources.requests.nvidia\\.com/gpu=1 --set resources.limits.nvidia\\.com/gpu=1"
+            NODE_SELECTOR="--set nodeSelector.gpu=true"
+            TOLERATIONS="--set-json tolerations='[{\"key\":\"gpu\",\"operator\":\"Equal\",\"value\":\"true\",\"effect\":\"NoSchedule\"}]'"
+          else
+            GPU_RESOURCES=""
+            NODE_SELECTOR=""
+            TOLERATIONS=""
+          fi
+
+          # Deploy or upgrade the release
+          helm upgrade --install fn-media-ai ./fn-infra/helm/fn-media-ai \
+            --namespace ${{ steps.params.outputs.namespace }} \
+            --values ./fn-infra/helm/fn-media-ai/${{ steps.params.outputs.values_file }} \
+            --set image.tag=${{ needs.build-image.outputs.version }} \
+            --set image.repository=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE }} \
+            --set-string image.digest=${{ needs.build-image.outputs.image-digest }} \
+            --set environment=${{ steps.params.outputs.environment }} \
+            --set appVersion=${{ needs.build-image.outputs.version }} \
+            --set redis.host=${{ needs.configure-cache.outputs.redis_host }} \
+            --set redis.port=${{ needs.configure-cache.outputs.redis_port }} \
+            --set-string redis.auth=${{ needs.configure-cache.outputs.redis_auth }} \
+            --set ai.deploymentType=${{ steps.params.outputs.deployment_type }} \
+            $GPU_RESOURCES \
+            $NODE_SELECTOR \
+            $TOLERATIONS \
+            --timeout 15m \
+            --wait \
+            --atomic \
+            --create-namespace
+
+          # Get service URL
+          SERVICE_IP=$(kubectl get svc fn-media-ai -n ${{ steps.params.outputs.namespace }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
+          echo "url=http://${SERVICE_IP}" >> $GITHUB_OUTPUT
+
+      - name: Verify deployment health
+        run: |
+          # Wait for deployment to be ready (longer timeout for model loading)
+          kubectl rollout status deployment/fn-media-ai -n ${{ steps.params.outputs.namespace }} --timeout=10m
+
+          # Check pod status
+          kubectl get pods -n ${{ steps.params.outputs.namespace }} -l app.kubernetes.io/name=fn-media-ai
+
+          # Check GPU allocation (if GPU deployment)
+          if [[ "${{ steps.params.outputs.deployment_type }}" == "gpu" ]]; then
+            echo "GPU allocation status:"
+            kubectl get pods -n ${{ steps.params.outputs.namespace }} -l app.kubernetes.io/name=fn-media-ai -o yaml | grep -A5 "nvidia.com/gpu"
+          fi
+
+          # Run health check
+          POD_NAME=$(kubectl get pods -n ${{ steps.params.outputs.namespace }} -l app.kubernetes.io/name=fn-media-ai -o jsonpath='{.items[0].metadata.name}')
+
+          # Wait for AI models to load
+          echo "Waiting for AI models to load..."
+          for i in {1..60}; do
+            if kubectl exec -n ${{ steps.params.outputs.namespace }} $POD_NAME -- wget --spider -q http://localhost:8000/health; then
+              echo "Health check passed"
+              break
+            fi
+            echo "Attempt $i/60: Waiting for service to be ready..."
+            sleep 5
+          done
+
+          # Check AI model status
+          kubectl exec -n ${{ steps.params.outputs.namespace }} $POD_NAME -- wget -qO- http://localhost:8000/api/v1/models/status || true
+
+      - name: Run smoke tests
+        run: |
+          POD_NAME=$(kubectl get pods -n ${{ steps.params.outputs.namespace }} -l app.kubernetes.io/name=fn-media-ai -o jsonpath='{.items[0].metadata.name}')
+
+          # Test health endpoint
+          kubectl exec -n ${{ steps.params.outputs.namespace }} $POD_NAME -- wget -qO- http://localhost:8000/health
+
+          # Test metrics endpoint
+          kubectl exec -n ${{ steps.params.outputs.namespace }} $POD_NAME -- wget -qO- http://localhost:8000/metrics | head -20
+
+          # Test OpenAPI docs
+          kubectl exec -n ${{ steps.params.outputs.namespace }} $POD_NAME -- wget --spider -q http://localhost:8000/docs
+
+      - name: Record deployment
+        if: success()
+        run: |
+          kubectl annotate deployment fn-media-ai -n ${{ steps.params.outputs.namespace }} \
+            deployment.kubernetes.io/revision-${{ github.run_number }}="${{ needs.build-image.outputs.version }}" \
+            deployment.kubernetes.io/github-sha="${{ github.sha }}" \
+            deployment.kubernetes.io/github-run="${{ github.run_id }}" \
+            deployment.kubernetes.io/deployed-by="${{ github.actor }}" \
+            deployment.kubernetes.io/deployed-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            deployment.kubernetes.io/deployment-type="${{ steps.params.outputs.deployment_type }}" \
+            --overwrite
+
+  # Rollback Job
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.rollback == 'true'
+    steps:
+      - name: Checkout fn-infra repository
+        uses: actions/checkout@v4
+        with:
+          repository: findly-now/fn-infra
+          path: fn-infra
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GAR_LOCATION }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Determine environment
+        id: params
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "namespace=findly-${ENV}" >> $GITHUB_OUTPUT
+
+      - name: Get rollback revision
+        id: rollback
+        run: |
+          # Get the previous revision
+          CURRENT_REVISION=$(helm list -n ${{ steps.params.outputs.namespace }} -o json | jq -r '.[] | select(.name=="fn-media-ai") | .revision')
+          PREVIOUS_REVISION=$((CURRENT_REVISION - 1))
+
+          echo "current_revision=${CURRENT_REVISION}" >> $GITHUB_OUTPUT
+          echo "previous_revision=${PREVIOUS_REVISION}" >> $GITHUB_OUTPUT
+
+          # Show history
+          echo "Helm deployment history:"
+          helm history fn-media-ai -n ${{ steps.params.outputs.namespace }}
+
+      - name: Perform rollback
+        run: |
+          helm rollback fn-media-ai ${{ steps.rollback.outputs.previous_revision }} \
+            -n ${{ steps.params.outputs.namespace }} \
+            --wait \
+            --timeout 15m
+
+      - name: Verify rollback
+        run: |
+          # Wait for rollback to complete
+          kubectl rollout status deployment/fn-media-ai -n ${{ steps.params.outputs.namespace }} --timeout=10m
+
+          # Check pod status
+          kubectl get pods -n ${{ steps.params.outputs.namespace }} -l app.kubernetes.io/name=fn-media-ai
+
+          # Verify health
+          POD_NAME=$(kubectl get pods -n ${{ steps.params.outputs.namespace }} -l app.kubernetes.io/name=fn-media-ai -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec -n ${{ steps.params.outputs.namespace }} $POD_NAME -- wget -qO- http://localhost:8000/health
+
+      - name: Send rollback notification
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            Rollback ${{ job.status }} for fn-media-ai
+            Environment: ${{ steps.params.outputs.environment }}
+            Rolled back from revision ${{ steps.rollback.outputs.current_revision }} to ${{ steps.rollback.outputs.previous_revision }}
+            Actor: ${{ github.actor }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  # Notification Job
+  notify:
+    name: Send Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    steps:
+      - name: Send Slack notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ needs.deploy.result }}
+          text: |
+            Deployment ${{ needs.deploy.result }} for fn-media-ai
+            Version: ${{ needs.build-image.outputs.version }}
+            Environment: ${{ needs.deploy.outputs.environment }}
+            URL: ${{ needs.deploy.outputs.url }}
+            Actor: ${{ github.actor }}
+            Commit: ${{ github.sha }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        if: env.SLACK_WEBHOOK != ''
+
+      - name: Create deployment record in GitHub
+        uses: actions/github-script@v7
+        if: needs.deploy.result == 'success'
+        with:
+          script: |
+            await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              task: 'deploy',
+              auto_merge: false,
+              required_contexts: [],
+              payload: {
+                version: '${{ needs.build-image.outputs.version }}',
+                environment: '${{ needs.deploy.outputs.environment }}',
+                deployment_type: '${{ needs.deploy.outputs.deployment_type }}'
+              },
+              environment: '${{ needs.deploy.outputs.environment }}',
+              description: 'Deployment of fn-media-ai version ${{ needs.build-image.outputs.version }}'
+            });

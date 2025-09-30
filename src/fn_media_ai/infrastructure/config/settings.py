@@ -35,10 +35,10 @@ class Settings(BaseSettings):
 
     # Kafka settings
     kafka_bootstrap_servers: str = Field(..., env="KAFKA_BOOTSTRAP_SERVERS")
-    kafka_security_protocol: str = Field(default="SASL_SSL", env="KAFKA_SECURITY_PROTOCOL")
+    kafka_security_protocol: str = Field(default="PLAINTEXT", env="KAFKA_SECURITY_PROTOCOL")
     kafka_sasl_mechanism: str = Field(default="PLAIN", env="KAFKA_SASL_MECHANISM")
-    kafka_sasl_username: str = Field(..., env="KAFKA_SASL_USERNAME")
-    kafka_sasl_password: str = Field(..., env="KAFKA_SASL_PASSWORD")
+    kafka_sasl_username: Optional[str] = Field(default=None, env="KAFKA_SASL_USERNAME")
+    kafka_sasl_password: Optional[str] = Field(default=None, env="KAFKA_SASL_PASSWORD")
 
     # Kafka consumer settings
     kafka_consumer_group: str = Field(default="fn-media-ai", env="KAFKA_CONSUMER_GROUP")
@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     kafka_max_poll_records: int = Field(default=500, env="KAFKA_MAX_POLL_RECORDS")
 
     # Kafka producer settings
-    kafka_post_enhanced_topic: str = Field(default="media-ai.enrichment", env="KAFKA_POST_ENHANCED_TOPIC")
+    kafka_post_enhanced_topic: str = Field(default="posts.enhancements", env="KAFKA_POST_ENHANCED_TOPIC")
     kafka_producer_acks: str = Field(default="all", env="KAFKA_PRODUCER_ACKS")
     kafka_producer_retries: int = Field(default=2147483647, env="KAFKA_PRODUCER_RETRIES")
     kafka_producer_batch_size: int = Field(default=16384, env="KAFKA_PRODUCER_BATCH_SIZE")
@@ -58,6 +58,13 @@ class Settings(BaseSettings):
     gcs_bucket_name: str = Field(..., env="GCS_BUCKET_NAME")
     gcs_project_id: str = Field(..., env="GCS_PROJECT_ID")
     google_application_credentials: Optional[str] = Field(None, env="GOOGLE_APPLICATION_CREDENTIALS")
+
+    # Database settings (PostgreSQL)
+    database_url: str = Field(..., env="DATABASE_URL")
+    database_pool_min_size: int = Field(default=5, env="DATABASE_POOL_MIN_SIZE")
+    database_pool_max_size: int = Field(default=20, env="DATABASE_POOL_MAX_SIZE")
+    database_pool_timeout: int = Field(default=30, env="DATABASE_POOL_TIMEOUT")
+    database_command_timeout: int = Field(default=60, env="DATABASE_COMMAND_TIMEOUT")
 
     # OpenAI settings
     openai_api_key: str = Field(..., env="OPENAI_API_KEY")
@@ -175,6 +182,16 @@ class Settings(BaseSettings):
             config['password'] = self.redis_password
 
         return config
+
+    def get_database_config(self) -> dict:
+        """Get database configuration dictionary."""
+        return {
+            'dsn': self.database_url,
+            'min_size': self.database_pool_min_size,
+            'max_size': self.database_pool_max_size,
+            'timeout': self.database_pool_timeout,
+            'command_timeout': self.database_command_timeout,
+        }
 
     def get_openai_config(self) -> dict:
         """Get OpenAI configuration dictionary."""

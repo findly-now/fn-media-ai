@@ -1,5 +1,7 @@
 # AI Pipeline Implementation Summary
 
+**Document Ownership**: This document OWNS AI pipeline implementation status, model performance tracking, and development progress documentation.
+
 ## Overview
 
 This document summarizes the **CURRENT** AI pipeline implementation for the fn-media-ai service. The system provides a **WORKING FOUNDATION** with simulated AI models for analyzing Lost & Found photos and generating enhanced metadata.

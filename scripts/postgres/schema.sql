@@ -1,6 +1,12 @@
 -- FN Media AI Database Schema
 -- Stores AI processing results and metadata
 
+-- Enable UUID extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Create enum for processing status
+CREATE TYPE processing_status AS ENUM ('pending', 'processing', 'completed', 'failed');
+
 -- Photo analysis results table
 CREATE TABLE IF NOT EXISTS photo_analyses (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

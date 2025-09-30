@@ -1,5 +1,7 @@
 # FN Media AI - DevOps Infrastructure
 
+**Document Ownership**: This document OWNS Media AI deployment procedures, AI model deployment, and infrastructure setup.
+
 This document describes the comprehensive DevOps pipeline and infrastructure setup for the FN Media AI service.
 
 ## 🏗️ Infrastructure Overview

@@ -30,8 +30,8 @@ services:
       - ENVIRONMENT=development
       - LOG_LEVEL=DEBUG
       - REDIS_URL=redis://redis:6379/0
-      - KAFKA_BROKERS=kafka:9092
-      - DATABASE_URL=postgresql://findly:findly@postgres:5432/findly_media_ai
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - DATABASE_URL=postgresql://media_ai_user:media_ai_password@media-ai-postgres:5432/media_ai_db
       - GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcs-key.json
       - OPENAI_API_KEY=${OPENAI_API_KEY:-demo-key}
       - FEATURE_GPU_ACCELERATION=false
@@ -39,7 +39,7 @@ services:
     depends_on:
       - redis
       - kafka
-      - postgres
+      - media-ai-postgres
     networks:
       - findly-ai-network
     restart: unless-stopped
@@ -72,71 +72,69 @@ services:
       retries: 3
 
   # =================================================================
-  # PostgreSQL - Metadata Storage
+  # PostgreSQL - Isolated Metadata Storage for Media AI Service
   # =================================================================
-  postgres:
+  media-ai-postgres:
     image: postgres:15-alpine
-    platform: linux/amd64
-    container_name: fn-media-ai-postgres
+    container_name: media-ai-postgres-isolated
     ports:
-      - "5432:5432"
+      - "5435:5432"  # Different port to avoid conflicts
     environment:
-      POSTGRES_DB: findly_media_ai
-      POSTGRES_USER: findly
-      POSTGRES_PASSWORD: findly
+      POSTGRES_DB: media_ai_db
+      POSTGRES_USER: media_ai_user
+      POSTGRES_PASSWORD: media_ai_password
+      POSTGRES_HOST_AUTH_METHOD: trust
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - media_ai_postgres_data:/var/lib/postgresql/data
       - ./scripts/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
       - ./scripts/postgres/schema.sql:/docker-entrypoint-initdb.d/02-schema.sql:ro
     networks:
       - findly-ai-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U findly -d findly_media_ai"]
+      test: ["CMD-SHELL", "pg_isready -U media_ai_user -d media_ai_db"]
       interval: 10s
       timeout: 5s
       retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+        reservations:
+          memory: 64M
+          cpus: '0.1'
 
   # =================================================================
-  # Apache Kafka - Event Streaming
+  # Apache Kafka - Event Streaming (KRaft Mode - No Zookeeper)
   # =================================================================
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.4.0
-    platform: linux/amd64
-    container_name: fn-media-ai-zookeeper
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    volumes:
-      - zookeeper-data:/var/lib/zookeeper/data
-      - zookeeper-logs:/var/lib/zookeeper/log
-    networks:
-      - findly-ai-network
-    restart: unless-stopped
-
   kafka:
-    image: confluentinc/cp-kafka:7.4.0
-    platform: linux/amd64
+    image: confluentinc/cp-kafka:7.5.0
     container_name: fn-media-ai-kafka
     ports:
       - "9092:9092"
-      - "9094:9094"
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+      # KRaft Configuration (Zookeeper-free Kafka)
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
       KAFKA_NUM_PARTITIONS: 3
       KAFKA_DEFAULT_REPLICATION_FACTOR: 1
     volumes:
       - kafka-data:/var/lib/kafka/data
-    depends_on:
-      - zookeeper
     networks:
       - findly-ai-network
     restart: unless-stopped
@@ -157,7 +155,6 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
-      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
     depends_on:
       - kafka
     networks:
@@ -259,14 +256,10 @@ networks:
 volumes:
   redis-data:
     name: fn-media-ai-redis-data
-  postgres-data:
-    name: fn-media-ai-postgres-data
+  media_ai_postgres_data:
+    name: fn-media-ai-postgres-isolated-data
   kafka-data:
     name: fn-media-ai-kafka-data
-  zookeeper-data:
-    name: fn-media-ai-zookeeper-data
-  zookeeper-logs:
-    name: fn-media-ai-zookeeper-logs
   minio-data:
     name: fn-media-ai-minio-data
   prometheus-data:

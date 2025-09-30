@@ -1,10 +1,12 @@
 # CLAUDE.md - FN Media AI Development Guidelines
 
+**Document Ownership**: This document OWNS Media AI domain AI guidance, Python ML patterns, and AI pipeline development.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with the FN Media AI service codebase.
 
 ## Service Overview
 
-**FN Media AI** is an AI-powered photo analysis service that transforms Lost & Found posts into rich, searchable metadata through computer vision and machine learning. This service is part of the Findly Now ecosystem and follows Domain-Driven Design (DDD) patterns.
+**FN Media AI** is an AI-powered photo analysis service with **fat events** and **privacy-first design** that transforms Lost & Found posts into rich, searchable metadata through computer vision and machine learning. This service is part of the Findly Now ecosystem and follows Domain-Driven Design (DDD) patterns.
 
 ## Core Mission
 
